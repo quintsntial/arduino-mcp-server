@@ -2,6 +2,10 @@
 
 Arduino MCP server for `arduino-cli` workflows: dependency checks/install, hardware detection, compile/upload, serial monitoring, and board reference lookup.
 
+This repo now includes both MCP metadata formats:
+- `server.json` for MCP Registry metadata.
+- `manifest.json` for MCP bundle (`.mcpb`) packaging for Claude Desktop extensions.
+
 ## Quick Start
 Install globally:
 
@@ -45,6 +49,20 @@ Codex MCP config:
 }
 ```
 
+## MCP Bundle (MCPB)
+Build output and validate/package the extension bundle:
+
+```bash
+npm run build
+npm run mcpb:validate
+npm run mcpb:pack
+```
+
+Notes:
+- `manifest.json` is the bundle manifest consumed by `mcpb`.
+- `.mcpbignore` excludes dev/reference files from bundle packaging.
+- Bundle output is written as `<name>.mcpb` in the current directory by default.
+
 ## Features
 - `arduino_cli_doctor` and `install_arduino_cli` for dependency bootstrap
 - `detect_hardware` with board/FQBN inference and user-confirmation guidance
@@ -69,7 +87,15 @@ Tools:
 - `ensure_core_installed`
 - `compile_sketch`
 - `upload_sketch`
+- `upload_and_wait_ready`
 - `read_serial_snapshot`
+- `safety_preflight`
+- `serial_open_session`
+- `serial_list_sessions`
+- `serial_read`
+- `serial_expect`
+- `serial_write`
+- `serial_close_session`
 - `list_connected_boards`
 - `list_supported_boards`
 - `list_serial_ports`
