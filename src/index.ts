@@ -23,9 +23,12 @@ import { PortOperationCoordinator } from "./portCoordinator.js";
 import { SerialSessionManager } from "./serialSessions.js";
 import { runSafetyPreflight, type PowerSpec, type WiringSignal } from "./safety.js";
 
+const cliPathFromEnv = process.env.ARDUINO_CLI_PATH?.trim();
+const sketchRootFromEnv = process.env.ARDUINO_SKETCH_ROOT?.trim();
+
 const arduinoConfig: ArduinoCliConfig = {
-  cliPath: process.env.ARDUINO_CLI_PATH ?? "arduino-cli",
-  sketchRoot: process.env.ARDUINO_SKETCH_ROOT
+  cliPath: cliPathFromEnv && cliPathFromEnv.length > 0 ? cliPathFromEnv : "arduino-cli",
+  sketchRoot: sketchRootFromEnv && sketchRootFromEnv.length > 0 ? sketchRootFromEnv : undefined
 };
 
 const portCoordinator = new PortOperationCoordinator();
