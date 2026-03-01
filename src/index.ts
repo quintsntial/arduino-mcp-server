@@ -883,8 +883,7 @@ server.registerTool(
     },
     outputSchema: toolOutputShape,
     annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: true,
       openWorldHint: true
     }
@@ -1056,8 +1055,7 @@ server.registerTool(
     },
     outputSchema: toolOutputShape,
     annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: true,
       openWorldHint: false
     }
@@ -1349,8 +1347,7 @@ server.registerTool(
     },
     outputSchema: toolOutputShape,
     annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: true,
       openWorldHint: false
     }
@@ -1480,8 +1477,7 @@ server.registerTool(
     },
     outputSchema: toolOutputShape,
     annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: true,
       openWorldHint: false
     }
@@ -1699,8 +1695,7 @@ server.registerTool(
     },
     outputSchema: toolOutputShape,
     annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: false,
       openWorldHint: false
     }
@@ -2051,8 +2046,7 @@ server.registerTool(
     },
     outputSchema: toolOutputShape,
     annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: false,
       openWorldHint: false
     }
@@ -2267,8 +2261,7 @@ server.registerTool(
     },
     outputSchema: toolOutputShape,
     annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: false,
       openWorldHint: false
     }
@@ -2397,8 +2390,7 @@ server.registerTool(
     },
     outputSchema: toolOutputShape,
     annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: true,
       openWorldHint: false
     }

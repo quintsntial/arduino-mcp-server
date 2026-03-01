@@ -1,6 +1,6 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-17/manifest.schema.json",
-  "manifest_version": "0.1",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-02/manifest.schema.json",
+  "manifest_version": "0.3",
   "name": "arduino-mcp-server",
   "display_name": "Arduino MCP Server",
   "version": "0.2.6",
@@ -16,6 +16,9 @@
   },
   "homepage": "https://github.com/akshatnerella/arduino-mcp-server",
   "documentation": "https://github.com/akshatnerella/arduino-mcp-server#readme",
+  "privacy_policies": [
+    "https://github.com/akshatnerella/arduino-mcp-server/blob/main/PRIVACY.md"
+  ],
   "license": "MIT",
   "keywords": [
     "mcp",
