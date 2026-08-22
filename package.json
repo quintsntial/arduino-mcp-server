@@ -1,6 +1,6 @@
 {
   "name": "arduino-mcp-server",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Arduino CLI wrapper MCP server",
   "type": "module",
   "main": "build/index.js",
@@ -21,6 +21,7 @@
     "dev": "tsx src/index.ts",
     "start": "node build/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test src/**/*.test.ts",
     "mcpb:validate": "npx @anthropic-ai/mcpb validate .",
     "mcpb:pack": "npx @anthropic-ai/mcpb pack ."
   },
