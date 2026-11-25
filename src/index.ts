@@ -12,6 +12,8 @@ import {
   type BoardReference
 } from "./boardReference.js";
 import {
+  captureMonitor,
+  type MonitorCapture,
   resolveSketchPath,
   runArduinoCli,
   runCommand,
@@ -32,6 +34,7 @@ import {
   type ProjectConfig,
   type ResolvedTargets
 } from "./projectConfig.js";
+import { findBootMarker, parseDiagnostics, parseMemoryUse, serialLines, tail } from "./output.js";
 
 const cliPathFromEnv = process.env.ARDUINO_CLI_PATH?.trim();
 const sketchRootFromEnv = process.env.ARDUINO_SKETCH_ROOT?.trim();
@@ -79,16 +82,33 @@ const toolOutputShape = {
 const toolOutputSchema = z.object(toolOutputShape);
 type ToolOutput = z.infer<typeof toolOutputSchema>;
 
+const RAW_TAIL_CHARS = 3000;
+
+/** Keep raw CLI output short: the model reads every byte. Parsed JSON already lives in data. */
+function compactRaw(raw: CommandResult): CommandResult {
+  const isJsonCommand = raw.args.includes("--format") && raw.args.includes("json");
+  return {
+    ...raw,
+    command: path.basename(raw.command),
+    stdout:
+      raw.ok && isJsonCommand && tryParseJson<unknown>(raw.stdout) !== null
+        ? "(JSON output parsed into data)"
+        : tail(raw.stdout, RAW_TAIL_CHARS),
+    stderr: tail(raw.stderr, RAW_TAIL_CHARS)
+  };
+}
+
 function toToolResult(payload: ToolOutput, isError = false) {
+  const compacted: ToolOutput = payload.raw ? { ...payload, raw: compactRaw(payload.raw) } : payload;
   return {
     isError,
     content: [
       {
         type: "text" as const,
-        text: JSON.stringify(payload, null, 2)
+        text: JSON.stringify(compacted)
       }
     ],
-    structuredContent: payload
+    structuredContent: compacted
   };
 }
 
@@ -796,6 +816,22 @@ function configSummary(config: ProjectConfig | null) {
   };
 }
 
+/** Short form of a passed safety gate for upload results (the full report is in safety_preflight). */
+function safetySummary(gate: Awaited<ReturnType<typeof runSafetyGate>>) {
+  if (!gate.ok) {
+    return null;
+  }
+  if (gate.skipped || !("safety" in gate) || !gate.safety) {
+    return { skipped: true };
+  }
+  return {
+    status: gate.safety.status,
+    board: gate.safety.boardId,
+    source: gate.source,
+    findings: gate.safety.findings.map((finding) => `${finding.severity}: ${finding.code}`)
+  };
+}
+
 function settingsMissingResult(command: string, resolved: ResolvedTargets) {
   return toToolResult(
     {
@@ -970,35 +1006,41 @@ server.registerTool(
           installed,
           version: installed ? parsedVersion : null,
           rawVersionOutput,
-          installGuide: guide,
-          envVarGuide,
-          agentRequiredWorkflow: installed
-            ? [
-                "Proceed with detect_hardware.",
-                "Use compile_sketch and upload_sketch for build/deploy."
-              ]
-            : [
-                "Stop workflows that depend on arduino-cli.",
-                "Call install_arduino_cli (method=auto).",
-                "If install tool fails, install arduino-cli using installGuide.",
-                "If binary is not on PATH, set ARDUINO_CLI_PATH using envVarGuide.",
-                "Restart the MCP server session if environment changed.",
-                "Re-run arduino_cli_doctor and require installed=true.",
-                "Then run detect_hardware."
-              ],
-          strictPolicy: {
-            noFallbackHardwareScanWithoutCli: true,
-            reason:
-              "Board/FQBN resolution and Arduino workflows must come from arduino-cli for reliable behavior."
-          },
-          postInstallChecks: [
-            "arduino-cli version",
-            "arduino-cli core update-index",
-            "arduino-cli board list --format json"
-          ],
-          nextRecommendedToolCall: "detect_hardware"
+          // Install guidance only matters when the CLI is missing; keep the healthy answer short.
+          ...(installed
+            ? {
+                nextRecommendedToolCall: "get_project_config",
+                agentRequiredWorkflow: [
+                  "Call get_project_config to read tools/board.env, or detect_hardware when there is none.",
+                  "Use compile_sketch and upload_sketch for build/deploy."
+                ]
+              }
+            : {
+                installGuide: guide,
+                envVarGuide,
+                agentRequiredWorkflow: [
+                  "Stop workflows that depend on arduino-cli.",
+                  "Call install_arduino_cli (method=auto).",
+                  "If install tool fails, install arduino-cli using installGuide.",
+                  "If binary is not on PATH, set ARDUINO_CLI_PATH using envVarGuide.",
+                  "Restart the MCP server session if environment changed.",
+                  "Re-run arduino_cli_doctor and require installed=true.",
+                  "Then run detect_hardware."
+                ],
+                strictPolicy: {
+                  noFallbackHardwareScanWithoutCli: true,
+                  reason:
+                    "Board/FQBN resolution and Arduino workflows must come from arduino-cli for reliable behavior."
+                },
+                postInstallChecks: [
+                  "arduino-cli version",
+                  "arduino-cli core update-index",
+                  "arduino-cli board list --format json"
+                ],
+                nextRecommendedToolCall: "detect_hardware"
+              })
         },
-        raw,
+        raw: installed ? undefined : raw,
         note: installed
           ? "Arduino CLI is available."
           : "Arduino CLI is not available. Install it, set ARDUINO_CLI_PATH if needed, and re-run this tool.",
@@ -1556,13 +1598,19 @@ server.registerTool(
       }
 
       const raw = await runArduinoCli(arduinoConfig, args, 300_000);
+      const diagnostics = parseDiagnostics(raw.stderr);
+      const errors = diagnostics.filter((d) => d.severity === "error");
       return toToolResult(
         {
           ok: raw.ok,
+          status: raw.ok ? (diagnostics.some((d) => d.severity === "warning") ? "warning" : "ok") : "error",
           command: "compile",
           data: {
             sketchPath: resolvedSketchPath,
             fqbn,
+            memory: parseMemoryUse(raw.stdout),
+            errors,
+            warnings: diagnostics.filter((d) => d.severity === "warning"),
             project: configSummary(targets.config),
             coreId,
             coreEnsure: coreEnsure
@@ -1574,7 +1622,11 @@ server.registerTool(
               : null
           },
           raw,
-          error: raw.ok ? undefined : withCliHint("Sketch compilation failed.", raw)
+          error: raw.ok
+            ? undefined
+            : errors.length > 0
+              ? `Sketch compilation failed with ${errors.length} error(s); first: ${errors[0].file.split("/").pop()}:${errors[0].line}: ${errors[0].message}`
+              : withCliHint("Sketch compilation failed.", raw)
         },
         !raw.ok
       );
@@ -1803,15 +1855,7 @@ server.registerTool(
               project: configSummary(targets.config),
               outputs: outputs ?? targets.config?.outputs ?? null,
               coreId,
-              safety: safetyGate.skipped
-                ? {
-                    skipped: true
-                  }
-                : {
-                    source: safetyGate.source,
-                    confidenceType: safetyGate.confidenceType,
-                    preflight: safetyGate.safety
-                  },
+              safety: safetySummary(safetyGate),
               coreEnsure: coreEnsure
                 ? {
                     installed: coreEnsure.installed,
@@ -2041,19 +2085,16 @@ server.registerTool(
         }
 
         let readyMatched = true;
-        let readyRaw: CommandResult | null = null;
+        let capture: MonitorCapture | null = null;
         if (readyPattern && readyPattern.trim().length > 0) {
-          readyRaw = await runArduinoCli(
-            arduinoConfig,
-            ["monitor", "-p", port, "-c", `baudrate=${Math.floor(readyBaudRate)}`],
-            Math.min(Math.max(readyTimeoutMs, 500), 120_000)
-          );
-
-          const serialText = `${readyRaw.stdout}\n${readyRaw.stderr}`;
-          const needle = readyCaseSensitive ? readyPattern : readyPattern.toLowerCase();
-          const haystack = readyCaseSensitive ? serialText : serialText.toLowerCase();
-          readyMatched = haystack.includes(needle);
+          capture = await captureMonitor(arduinoConfig.cliPath, port, readyBaudRate, {
+            timeoutMs: Math.min(Math.max(readyTimeoutMs, 500), 120_000),
+            pattern: readyPattern,
+            caseSensitive: readyCaseSensitive
+          });
+          readyMatched = capture.matched;
         }
+        const uploadMemory = parseMemoryUse(uploadRaw.stdout);
 
         return toToolResult(
           {
@@ -2073,21 +2114,25 @@ server.registerTool(
               readyPattern: readyPattern ?? null,
               readyBaudRate,
               readyMatched,
-              safety: safetyGate.skipped
-                ? { skipped: true }
-                : {
-                    source: safetyGate.source,
-                    confidenceType: safetyGate.confidenceType,
-                    preflight: safetyGate.safety
-                  }
+              waitedMs: capture?.durationMs ?? null,
+              monitorStarts: capture?.attempts ?? null,
+              bootMarker: capture ? findBootMarker(capture.text) : null,
+              serialLines: capture ? serialLines(capture.text).slice(-40) : [],
+              memory: uploadMemory ?? undefined,
+              safety: safetySummary(safetyGate)
             },
-            rawTail: {
-              stdout: readyRaw ? readyRaw.stdout.slice(-2000) : uploadRaw.stdout.slice(-2000),
-              stderr: readyRaw ? readyRaw.stderr.slice(-2000) : uploadRaw.stderr.slice(-2000)
-            },
+            rawTail: capture?.stderr ? { stderr: tail(capture.stderr, 1000) } : undefined,
+            nextActions: readyMatched
+              ? undefined
+              : [
+                  "Check that the sketch prints the pattern at this baud rate (Serial.begin), and that no other program holds the port.",
+                  "An old boot marker in serialLines means the old code is still running."
+                ],
             error: readyMatched
               ? undefined
-              : "Upload succeeded but readiness pattern was not observed before timeout."
+              : capture && capture.text.length === 0
+                ? "Upload succeeded but no serial output arrived before the timeout."
+                : "Upload succeeded but readiness pattern was not observed before timeout."
           },
           !readyMatched
         );
@@ -2138,30 +2183,27 @@ server.registerTool(
 
       try {
         const boundedDurationMs = Math.min(Math.max(durationMs, 500), 60_000);
-        const raw = await runArduinoCli(
-          arduinoConfig,
-          ["monitor", "-p", port, "-c", `baudrate=${Math.floor(baudRate)}`],
-          boundedDurationMs
-        );
-
-        const ok = raw.ok || raw.timedOut;
+        const capture = await captureMonitor(arduinoConfig.cliPath, port, baudRate, { timeoutMs: boundedDurationMs });
+        // No output plus monitor errors means the port could not be read (missing, held elsewhere).
+        const ok = capture.text.length > 0 || capture.stderr.length === 0;
         return toToolResult(
           {
             ok,
-            status: ok ? "ok" : "error",
+            status: ok ? (capture.text.length > 0 ? "ok" : "warning") : "error",
             command: "monitor",
             stage: "serial_monitor_snapshot",
             errorCode: ok ? undefined : "SERIAL_MONITOR_FAILED",
             data: {
               port,
               baudRate,
-              durationMs: boundedDurationMs
+              durationMs: capture.durationMs,
+              monitorStarts: capture.attempts,
+              bootMarker: findBootMarker(capture.text),
+              lines: serialLines(capture.text).slice(-200)
             },
-            note: raw.timedOut
-              ? "Capture stopped at timeout (expected for snapshot mode)."
-              : "Monitor exited before timeout.",
-            raw,
-            error: ok ? undefined : withCliHint("Serial monitor failed.", raw)
+            note: capture.text.length === 0 ? "No serial output arrived during the capture." : undefined,
+            rawTail: capture.stderr ? { stderr: tail(capture.stderr, 1000) } : undefined,
+            error: ok ? undefined : `Serial monitor failed: ${tail(capture.stderr, 300)}`
           },
           !ok
         );

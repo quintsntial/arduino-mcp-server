@@ -103,6 +103,76 @@ export async function runCommand(
   });
 }
 
+export interface MonitorCapture {
+  text: string; // everything received, across reconnects
+  matched: boolean; // pattern found (always false without a pattern)
+  durationMs: number;
+  attempts: number; // monitor starts (more than 1 when the port re-enumerated after reset)
+  stderr: string;
+}
+
+/**
+ * Capture serial output with `arduino-cli monitor` for up to timeoutMs, stopping early once the
+ * pattern appears. stdin must stay open: with stdin closed the monitor exits after about a second
+ * having read nothing. If the monitor exits early (port briefly gone after an upload reset, as on
+ * ATmega32U4 boards), it is restarted until the deadline.
+ */
+export async function captureMonitor(
+  cliPath: string,
+  port: string,
+  baudRate: number,
+  opts: { timeoutMs: number; pattern?: string; caseSensitive?: boolean }
+): Promise<MonitorCapture> {
+  const started = Date.now();
+  const deadline = started + opts.timeoutMs;
+  const pattern = opts.pattern && opts.pattern.length > 0 ? opts.pattern : undefined;
+  const needle = pattern && !opts.caseSensitive ? pattern.toLowerCase() : pattern;
+  let text = "";
+  let stderr = "";
+  let attempts = 0;
+  let matched = false;
+
+  const found = () => {
+    if (!needle) {
+      return false;
+    }
+    return (opts.caseSensitive ? text : text.toLowerCase()).includes(needle);
+  };
+
+  while (!matched && Date.now() < deadline) {
+    attempts += 1;
+    await new Promise<void>((resolve) => {
+      const child = spawn(cliPath, ["monitor", "-p", port, "-c", `baudrate=${Math.floor(baudRate)}`, "--quiet"], {
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+      const timer = setTimeout(() => child.kill(), Math.max(deadline - Date.now(), 0));
+      child.stdout.on("data", (chunk: Buffer) => {
+        text += chunk.toString("latin1");
+        if (found()) {
+          matched = true;
+          // Let the rest of the matching line arrive before stopping.
+          setTimeout(() => child.kill(), 150);
+        }
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      child.on("error", (err) => {
+        stderr += `\n${err.message}`;
+      });
+      child.on("close", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    if (!matched && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 300)); // port re-enumerating: retry shortly
+    }
+  }
+
+  return { text, matched, durationMs: Date.now() - started, attempts, stderr: stderr.trim() };
+}
+
 export function tryParseJson<T>(value: string): T | null {
   try {
     return JSON.parse(value) as T;
