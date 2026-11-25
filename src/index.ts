@@ -22,6 +22,16 @@ import {
 import { PortOperationCoordinator } from "./portCoordinator.js";
 import { SerialSessionManager } from "./serialSessions.js";
 import { runSafetyPreflight, type BatterySpec, type PowerSpec, type WiringSignal } from "./safety.js";
+import {
+  OUTPUT_KINDS,
+  checkBaud,
+  checkOutputsGate,
+  loadProjectConfig,
+  resolveTargets,
+  type GateResult,
+  type ProjectConfig,
+  type ResolvedTargets
+} from "./projectConfig.js";
 
 const cliPathFromEnv = process.env.ARDUINO_CLI_PATH?.trim();
 const sketchRootFromEnv = process.env.ARDUINO_SKETCH_ROOT?.trim();
@@ -755,10 +765,143 @@ async function runSafetyGate(
   };
 }
 
-const server = new McpServer({
-  name: "arduino-mcp-server",
-  version: "0.2.5"
-});
+// ---- project settings (tools/board.env) and working rules ---------------------------------
+
+const projectDirSchema = z
+  .string()
+  .optional()
+  .describe(
+    "Project folder holding tools/board.env. Default: found by walking up from sketchPath, else from the folder Claude was started in."
+  );
+const outputsSchema = z
+  .enum(OUTPUT_KINDS)
+  .optional()
+  .describe(
+    "What the board's outputs drive, as confirmed by the user. Overrides OUTPUTS in tools/board.env. Never guess this."
+  );
+const confirmMainsSchema = z
+  .boolean()
+  .optional()
+  .describe("Required when outputs switch mains/heaters/motors: true only after the user approved THIS upload.");
+
+function configSummary(config: ProjectConfig | null) {
+  if (!config) {
+    return null;
+  }
+  return {
+    boardEnv: config.boardEnvPath,
+    board: config.boardComment,
+    outputs: config.outputs ?? null,
+    problems: config.problems.length > 0 ? config.problems : undefined
+  };
+}
+
+function settingsMissingResult(command: string, resolved: ResolvedTargets) {
+  return toToolResult(
+    {
+      ok: false,
+      status: "error",
+      command,
+      stage: "settings",
+      errorCode: "SETTINGS_MISSING",
+      error: `Missing: ${resolved.missing.join(", ")}.`,
+      data: { project: configSummary(resolved.config) },
+      nextActions: resolved.config
+        ? [`Add the missing keys to ${resolved.config.boardEnvPath}, or pass them as arguments.`]
+        : [
+            "No tools/board.env was found. Pass the values as arguments, or ask the user which board this is and create tools/board.env in the project.",
+            "Never guess the board."
+          ]
+    },
+    true
+  );
+}
+
+function gateFailedResult(command: string, stage: string, gate: GateResult, data?: unknown) {
+  return toToolResult(
+    {
+      ok: false,
+      status: "error",
+      command,
+      stage,
+      errorCode: gate.errorCode,
+      reasonCodes: gate.errorCode ? [gate.errorCode] : undefined,
+      error: gate.error,
+      data,
+      nextActions: gate.nextActions
+    },
+    true
+  );
+}
+
+const SERVER_INSTRUCTIONS = `Arduino boards via arduino-cli.
+
+Project settings: projects keep their board in tools/board.env (SKETCH_DIR, FQBN, PORT, BAUD, LIBS, CORE, OUTPUTS). Tools fill sketchPath/fqbn/port/baud from it when omitted; call get_project_config first to see what applies. If there is no board.env, ask the user which board it is. Never guess the board or the FQBN (a Nano clone usually needs arduino:avr:nano:cpu=atmega328old).
+
+Safety:
+- Before any upload it must be known what the board's outputs drive (OUTPUTS=leds|low-voltage|mains). If unknown, ask the user; upload tools refuse until then. For mains, heaters or motors, get the user's explicit go-ahead for every single upload (confirmMains=true).
+- Never open a serial port at 1200 baud: it resets ATmega32U4 boards into the bootloader.
+- Never change fuses or burn bootloaders. Do not call install_arduino_cli unless the user asks.
+- If a port is busy outside this server, ask the user to close the Arduino IDE Serial Monitor.
+
+Verifying code: sketches should print a boot marker at the end of setup(), e.g. Serial.println("BOOT <name> v3"); bump it on every change. "Upload OK" does not prove the new code runs: after uploading, open a serial session at the sketch's baud rate and serial_expect the new marker (opening the port resets most AVR boards). An old marker means old code. Report only what the serial output proves.`;
+
+const server = new McpServer(
+  {
+    name: "arduino-mcp-server",
+    version: "0.2.9-local"
+  },
+  { instructions: SERVER_INSTRUCTIONS }
+);
+
+server.registerTool(
+  "get_project_config",
+  {
+    title: "Get Project Config",
+    description:
+      "Show the project settings from tools/board.env (board, FQBN, port, baud, libraries, what the outputs drive) that other tools use as defaults.",
+    inputSchema: {
+      projectDir: projectDirSchema,
+      sketchPath: z.string().optional().describe("Optional sketch path to find the project from.")
+    },
+    outputSchema: toolOutputShape,
+    annotations: {
+      readOnlyHint: true,
+      openWorldHint: false
+    }
+  },
+  async ({ projectDir, sketchPath }) => {
+    try {
+      const config = loadProjectConfig({ projectDir, sketchPath });
+      if (!config) {
+        return toToolResult(
+          {
+            ok: false,
+            status: "warning",
+            command: "get_project_config",
+            errorCode: "NO_BOARD_ENV",
+            error: "No tools/board.env found.",
+            data: { searched: { sketchPath: sketchPath ?? null, projectDir: projectDir ?? null, cwd: process.cwd() } },
+            nextActions: [
+              "Ask the user which board, port and baud rate to use and what the outputs drive, then create <project>/tools/board.env."
+            ]
+          },
+          false
+        );
+      }
+      const missing = (["sketchPath", "fqbn", "port", "baud", "outputs"] as const).filter((key) => !config[key]);
+      return toToolResult({
+        ok: true,
+        status: missing.length > 0 || config.problems.length > 0 ? "warning" : "ok",
+        command: "get_project_config",
+        data: { ...config, missing },
+        note: missing.length > 0 ? `Not set in board.env: ${missing.join(", ")}.` : undefined
+      });
+    } catch (error) {
+      return toUnhandledError(error);
+    }
+  }
+);
 
 server.registerTool(
   "list_connected_boards",
@@ -1334,10 +1477,12 @@ server.registerTool(
   "compile_sketch",
   {
     title: "Compile Sketch",
-    description: "Compile an Arduino sketch with a specific board FQBN.",
+    description:
+      "Compile an Arduino sketch with a specific board FQBN. sketchPath and fqbn default to SKETCH_DIR and FQBN in tools/board.env.",
     inputSchema: {
-      sketchPath: z.string().describe("Path to sketch folder or .ino file."),
-      fqbn: z.string().describe("Board FQBN, e.g. arduino:avr:uno."),
+      projectDir: projectDirSchema,
+      sketchPath: z.string().optional().describe("Path to sketch folder or .ino file. Default: SKETCH_DIR."),
+      fqbn: z.string().optional().describe("Board FQBN, e.g. arduino:avr:uno. Default: FQBN."),
       exportBinaries: z.boolean().optional().describe("If true, export binaries into sketch folder."),
       clean: z.boolean().optional().describe("If true, clean build cache before compile."),
       buildPath: z.string().optional().describe("Optional build output directory."),
@@ -1354,8 +1499,14 @@ server.registerTool(
       openWorldHint: false
     }
   },
-  async ({ sketchPath, fqbn, exportBinaries, clean, buildPath, warnings, autoInstallCore = true }) => {
+  async ({ projectDir, sketchPath: sketchPathArg, fqbn: fqbnArg, exportBinaries, clean, buildPath, warnings, autoInstallCore = true }) => {
     try {
+      const targets = resolveTargets({ projectDir, sketchPath: sketchPathArg, fqbn: fqbnArg }, ["sketchPath", "fqbn"]);
+      if (targets.missing.length > 0) {
+        return settingsMissingResult("compile", targets);
+      }
+      const sketchPath = targets.sketchPath!;
+      const fqbn = targets.fqbn!;
       const resolvedSketchPath = resolveSketchPath(sketchPath, arduinoConfig.sketchRoot);
       const coreId = fqbnToCoreId(fqbn);
       const coreEnsure = coreId ? await ensureCoreInstalled(coreId, autoInstallCore) : null;
@@ -1412,6 +1563,7 @@ server.registerTool(
           data: {
             sketchPath: resolvedSketchPath,
             fqbn,
+            project: configSummary(targets.config),
             coreId,
             coreEnsure: coreEnsure
               ? {
@@ -1436,11 +1588,15 @@ server.registerTool(
   "upload_sketch",
   {
     title: "Upload Sketch",
-    description: "Upload a compiled sketch to a connected board/port.",
+    description:
+      "Upload a compiled sketch to a connected board/port. sketchPath, port and fqbn default to tools/board.env. Refuses until it is known what the board's outputs drive (OUTPUTS); mains needs confirmMains for every upload.",
     inputSchema: {
-      sketchPath: z.string().describe("Path to sketch folder or .ino file."),
-      port: z.string().describe("Serial port path, e.g. COM6 or /dev/ttyACM0."),
-      fqbn: z.string().optional().describe("Optional board FQBN when auto-detect is insufficient."),
+      projectDir: projectDirSchema,
+      sketchPath: z.string().optional().describe("Path to sketch folder or .ino file. Default: SKETCH_DIR."),
+      port: z.string().optional().describe("Serial port path, e.g. COM6 or /dev/ttyACM0. Default: PORT."),
+      fqbn: z.string().optional().describe("Board FQBN. Default: FQBN."),
+      outputs: outputsSchema,
+      confirmMains: confirmMainsSchema,
       verify: z.boolean().optional().describe("Verify uploaded binary when supported."),
       autoInstallCore: z
         .boolean()
@@ -1505,15 +1661,33 @@ server.registerTool(
     }
   },
   async ({
-    sketchPath,
-    port,
-    fqbn,
+    projectDir,
+    sketchPath: sketchPathArg,
+    port: portArg,
+    fqbn: fqbnArg,
+    outputs,
+    confirmMains = false,
     verify,
     autoInstallCore = true,
     unsafeSkipPreflight = false,
     safetyContext
   }) => {
     try {
+      const targets = resolveTargets(
+        { projectDir, sketchPath: sketchPathArg, port: portArg, fqbn: fqbnArg },
+        ["sketchPath", "port"]
+      );
+      if (targets.missing.length > 0) {
+        return settingsMissingResult("upload", targets);
+      }
+      const sketchPath = targets.sketchPath!;
+      const port = targets.port!;
+      const fqbn = targets.fqbn;
+      const outputsGate = checkOutputsGate(outputs ?? targets.config?.outputs, confirmMains);
+      if (!outputsGate.ok) {
+        return gateFailedResult("upload", "outputs_check", outputsGate, { project: configSummary(targets.config) });
+      }
+
       const lockOwner = `upload_sketch:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
       const lock = acquirePortLockOrError(port, lockOwner, "upload_sketch");
       if (!lock.ok) {
@@ -1626,6 +1800,8 @@ server.registerTool(
               sketchPath: resolvedSketchPath,
               port,
               fqbn: fqbn ?? null,
+              project: configSummary(targets.config),
+              outputs: outputs ?? targets.config?.outputs ?? null,
               coreId,
               safety: safetyGate.skipped
                 ? {
@@ -1645,7 +1821,9 @@ server.registerTool(
                 : null
             },
             nextActions: raw.ok
-              ? ["Use serial_open_session or read_serial_snapshot to verify runtime logs."]
+              ? [
+                  "Upload OK does not prove the new code runs: open serial_open_session at the sketch's baud rate and serial_expect the new boot marker."
+                ]
               : ["Verify board port/FQBN and retry upload.", "Run detect_hardware if port mapping changed."],
             raw,
             error: raw.ok ? undefined : withCliHint("Sketch upload failed.", raw)
@@ -1666,11 +1844,14 @@ server.registerTool(
   {
     title: "Upload And Wait Ready",
     description:
-      "Upload a sketch and wait for a serial readiness pattern, handling post-upload reset/re-enumeration windows.",
+      "Upload a sketch and wait for a serial readiness pattern, handling post-upload reset/re-enumeration windows. sketchPath, port, fqbn and readyBaudRate default to tools/board.env. Same OUTPUTS rule as upload_sketch.",
     inputSchema: {
-      sketchPath: z.string().describe("Path to sketch folder or .ino file."),
-      port: z.string().describe("Serial port path, e.g. COM6 or /dev/ttyACM0."),
-      fqbn: z.string().optional().describe("Optional board FQBN when auto-detect is insufficient."),
+      projectDir: projectDirSchema,
+      sketchPath: z.string().optional().describe("Path to sketch folder or .ino file. Default: SKETCH_DIR."),
+      port: z.string().optional().describe("Serial port path, e.g. COM6 or /dev/ttyACM0. Default: PORT."),
+      fqbn: z.string().optional().describe("Board FQBN. Default: FQBN."),
+      outputs: outputsSchema,
+      confirmMains: confirmMainsSchema,
       verify: z.boolean().optional().describe("Verify uploaded binary when supported."),
       autoInstallCore: z
         .boolean()
@@ -1684,7 +1865,12 @@ server.registerTool(
         .max(120_000)
         .optional()
         .describe("How long to wait for readyPattern."),
-      readyBaudRate: z.number().int().positive().optional().describe("Baud rate for readiness check. Default 115200."),
+      readyBaudRate: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Baud rate for readiness check. Default: BAUD from tools/board.env, else 115200."),
       readyCaseSensitive: z.boolean().optional().describe("If true, readiness matching is case-sensitive."),
       unsafeSkipPreflight: z
         .boolean()
@@ -1733,19 +1919,44 @@ server.registerTool(
     }
   },
   async ({
-    sketchPath,
-    port,
-    fqbn,
+    projectDir,
+    sketchPath: sketchPathArg,
+    port: portArg,
+    fqbn: fqbnArg,
+    outputs,
+    confirmMains = false,
     verify,
     autoInstallCore = true,
     readyPattern,
     readyTimeoutMs = 20_000,
-    readyBaudRate = 115200,
+    readyBaudRate: readyBaudRateArg,
     readyCaseSensitive = false,
     unsafeSkipPreflight = false,
     safetyContext
   }) => {
     try {
+      const targets = resolveTargets(
+        { projectDir, sketchPath: sketchPathArg, port: portArg, fqbn: fqbnArg, baud: readyBaudRateArg },
+        ["sketchPath", "port"]
+      );
+      if (targets.missing.length > 0) {
+        return settingsMissingResult("upload_and_wait_ready", targets);
+      }
+      const sketchPath = targets.sketchPath!;
+      const port = targets.port!;
+      const fqbn = targets.fqbn;
+      const readyBaudRate = targets.baud ?? 115200;
+      const outputsGate = checkOutputsGate(outputs ?? targets.config?.outputs, confirmMains);
+      if (!outputsGate.ok) {
+        return gateFailedResult("upload_and_wait_ready", "outputs_check", outputsGate, {
+          project: configSummary(targets.config)
+        });
+      }
+      const baudGate = checkBaud(readyBaudRate);
+      if (readyPattern && !baudGate.ok) {
+        return gateFailedResult("upload_and_wait_ready", "baud_check", baudGate);
+      }
+
       const lockOwner = `upload_and_wait_ready:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
       const lock = acquirePortLockOrError(port, lockOwner, "upload_and_wait_ready");
       if (!lock.ok) {
@@ -1858,7 +2069,9 @@ server.registerTool(
               sketchPath: resolvedSketchPath,
               port,
               fqbn: fqbn ?? null,
+              project: configSummary(targets.config),
               readyPattern: readyPattern ?? null,
+              readyBaudRate,
               readyMatched,
               safety: safetyGate.skipped
                 ? { skipped: true }
@@ -1891,10 +2104,12 @@ server.registerTool(
   "read_serial_snapshot",
   {
     title: "Read Serial Snapshot",
-    description: "Capture serial output for a bounded duration from a given port.",
+    description:
+      "Capture serial output for a bounded duration from a given port. port and baudRate default to PORT and BAUD in tools/board.env.",
     inputSchema: {
-      port: z.string().describe("Serial port path, e.g. COM6 or /dev/ttyACM0."),
-      baudRate: z.number().int().positive().optional().describe("Baud rate. Default: 9600."),
+      projectDir: projectDirSchema,
+      port: z.string().optional().describe("Serial port path, e.g. COM6 or /dev/ttyACM0. Default: PORT."),
+      baudRate: z.number().int().positive().optional().describe("Baud rate. Default: BAUD, else 9600."),
       durationMs: z.number().int().min(500).max(60_000).optional().describe("Capture duration in ms.")
     },
     outputSchema: toolOutputShape,
@@ -1903,8 +2118,18 @@ server.registerTool(
       openWorldHint: false
     }
   },
-  async ({ port, baudRate = 9600, durationMs = 4000 }) => {
+  async ({ projectDir, port: portArg, baudRate: baudArg, durationMs = 4000 }) => {
     try {
+      const targets = resolveTargets({ projectDir, port: portArg, baud: baudArg }, ["port"]);
+      if (targets.missing.length > 0) {
+        return settingsMissingResult("monitor", targets);
+      }
+      const port = targets.port!;
+      const baudRate = targets.baud ?? 9600;
+      const baudGate = checkBaud(baudRate);
+      if (!baudGate.ok) {
+        return gateFailedResult("monitor", "baud_check", baudGate);
+      }
       const lockOwner = `read_serial_snapshot:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
       const lock = acquirePortLockOrError(port, lockOwner, "read_serial_snapshot");
       if (!lock.ok) {
@@ -2090,10 +2315,12 @@ server.registerTool(
   "serial_open_session",
   {
     title: "Serial Open Session",
-    description: "Open a stateful serial monitor session with port lock ownership.",
+    description:
+      "Open a stateful serial monitor session with port lock ownership. port and baudRate default to PORT and BAUD in tools/board.env.",
     inputSchema: {
-      port: z.string().describe("Serial port path, e.g. COM6 or /dev/ttyACM0."),
-      baudRate: z.number().int().positive().optional().describe("Baud rate. Default: 9600."),
+      projectDir: projectDirSchema,
+      port: z.string().optional().describe("Serial port path, e.g. COM6 or /dev/ttyACM0. Default: PORT."),
+      baudRate: z.number().int().positive().optional().describe("Baud rate. Default: BAUD, else 9600."),
       ttlMs: z.number().int().min(5_000).max(600_000).optional().describe("Session lease TTL in ms."),
       maxBufferBytes: z
         .number()
@@ -2110,8 +2337,18 @@ server.registerTool(
       openWorldHint: false
     }
   },
-  async ({ port, baudRate = 9600, ttlMs = 120_000, maxBufferBytes = 262_144 }) => {
+  async ({ projectDir, port: portArg, baudRate: baudArg, ttlMs = 120_000, maxBufferBytes = 262_144 }) => {
     try {
+      const targets = resolveTargets({ projectDir, port: portArg, baud: baudArg }, ["port"]);
+      if (targets.missing.length > 0) {
+        return settingsMissingResult("serial_open_session", targets);
+      }
+      const port = targets.port!;
+      const baudRate = targets.baud ?? 9600;
+      const baudGate = checkBaud(baudRate);
+      if (!baudGate.ok) {
+        return gateFailedResult("serial_open_session", "baud_check", baudGate);
+      }
       const result = await serialSessionManager.openSession({
         cliPath: arduinoConfig.cliPath,
         port,
@@ -2492,9 +2729,11 @@ server.registerTool(
   "get_board_details",
   {
     title: "Get Board Details",
-    description: "Get detailed board metadata from arduino-cli for a specific FQBN.",
+    description:
+      "Get detailed board metadata from arduino-cli for a specific FQBN, including menu options such as cpu=. fqbn defaults to FQBN in tools/board.env.",
     inputSchema: {
-      fqbn: z.string().describe("Board FQBN, e.g. arduino:avr:uno.")
+      projectDir: projectDirSchema,
+      fqbn: z.string().optional().describe("Board FQBN, e.g. arduino:avr:uno. Default: FQBN.")
     },
     outputSchema: toolOutputShape,
     annotations: {
@@ -2502,8 +2741,13 @@ server.registerTool(
       openWorldHint: false
     }
   },
-  async ({ fqbn }) => {
+  async ({ projectDir, fqbn: fqbnArg }) => {
     try {
+      const targets = resolveTargets({ projectDir, fqbn: fqbnArg }, ["fqbn"]);
+      if (targets.missing.length > 0) {
+        return settingsMissingResult("board details", targets);
+      }
+      const fqbn = targets.fqbn!;
       const raw = await runArduinoCli(arduinoConfig, ["board", "details", "--fqbn", fqbn, "--format", "json"]);
       const parsed = tryParseJson<unknown>(raw.stdout);
       return toToolResult(

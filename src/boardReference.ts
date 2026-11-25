@@ -60,11 +60,20 @@ export function findBoardReferenceByFqbn(fqbn: string): BoardReference | null {
     return null;
   }
 
-  return (
+  const matchExact = (target: string) =>
     store.boards.find((board) =>
-      board.fqbnCandidates.some((candidate) => candidate.toLowerCase() === normalized)
-    ) ?? null
-  );
+      board.fqbnCandidates.some((candidate) => candidate.toLowerCase() === target)
+    ) ?? null;
+
+  // An FQBN may carry board menu options after the third segment, e.g.
+  // "arduino:avr:nano:cpu=atmega328old". The reference lists base FQBNs, so fall back to
+  // "vendor:arch:board" when the full string has no exact match.
+  return matchExact(normalized) ?? matchExact(baseFqbn(normalized));
+}
+
+/** "vendor:arch:board[:menu=opt,...]" -> "vendor:arch:board" */
+export function baseFqbn(fqbn: string): string {
+  return fqbn.trim().split(":").slice(0, 3).join(":");
 }
 
 export function findBoardReference(query: string): BoardReference[] {
