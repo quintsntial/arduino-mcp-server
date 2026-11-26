@@ -78,11 +78,12 @@ Requires [arduino-cli](https://arduino.github.io/arduino-cli/) on your PATH, or 
 | `list_serial_ports` | List available serial ports |
 | `ensure_core_installed` | Check/install board cores |
 | `compile_sketch` | Compile a sketch for a target board |
-| `upload_sketch` | Upload compiled sketch to a board |
-| `upload_and_wait_ready` | Upload and wait for device ready signal |
+| `upload_sketch` | Compile the current source and upload it to a board |
+| `upload_and_wait_ready` | Compile, upload and wait for device ready signal |
 | `serial_open_session` | Open a stateful serial session |
-| `serial_read` | Read buffered serial data |
+| `serial_read` | Read buffered serial data (also after the session ended) |
 | `serial_expect` | Wait for a pattern in serial output |
+| `serial_record` | Record a session for up to 10 minutes, optionally saving every line to a file |
 | `serial_write` | Send data over serial |
 | `serial_close_session` | Close a serial session |
 | `serial_list_sessions` | List active serial sessions |

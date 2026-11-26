@@ -90,11 +90,11 @@
     },
     {
       "name": "upload_sketch",
-      "description": "Upload a sketch to a connected board and serial port."
+      "description": "Compile the current source and upload it to a connected board and serial port."
     },
     {
       "name": "upload_and_wait_ready",
-      "description": "Upload a sketch and wait for a serial readiness pattern after reboot."
+      "description": "Compile, upload a sketch and wait for a serial readiness pattern after reboot."
     },
     {
       "name": "read_serial_snapshot",
@@ -114,11 +114,15 @@
     },
     {
       "name": "serial_read",
-      "description": "Read buffered bytes from an active serial session."
+      "description": "Read buffered bytes from a serial session, also for a while after it ended."
     },
     {
       "name": "serial_expect",
       "description": "Wait for a text pattern in a serial session buffer with timeout."
+    },
+    {
+      "name": "serial_record",
+      "description": "Record a serial session for a set duration (up to 10 minutes), optionally saving every line to a file."
     },
     {
       "name": "serial_write",

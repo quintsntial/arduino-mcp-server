@@ -22,7 +22,7 @@ import {
   type CommandResult
 } from "./arduinoCli.js";
 import { PortOperationCoordinator } from "./portCoordinator.js";
-import { SerialSessionManager } from "./serialSessions.js";
+import { MAX_RECORD_MS, SerialSessionManager } from "./serialSessions.js";
 import { runSafetyPreflight, type BatterySpec, type PowerSpec, type WiringSignal } from "./safety.js";
 import {
   OUTPUT_KINDS,
@@ -34,7 +34,15 @@ import {
   type ProjectConfig,
   type ResolvedTargets
 } from "./projectConfig.js";
-import { findBootMarker, parseDiagnostics, parseMemoryUse, serialLines, tail } from "./output.js";
+import {
+  findBootMarker,
+  parseDiagnostics,
+  parseMemoryUse,
+  serialLines,
+  tail,
+  type Diagnostic,
+  type MemoryUse
+} from "./output.js";
 
 const cliPathFromEnv = process.env.ARDUINO_CLI_PATH?.trim();
 const sketchRootFromEnv = process.env.ARDUINO_SKETCH_ROOT?.trim();
@@ -880,7 +888,11 @@ Safety:
 - Never change fuses or burn bootloaders. Do not call install_arduino_cli unless the user asks.
 - If a port is busy outside this server, ask the user to close the Arduino IDE Serial Monitor.
 
-Verifying code: sketches should print a boot marker at the end of setup(), e.g. Serial.println("BOOT <name> v3"); bump it on every change. "Upload OK" does not prove the new code runs: after uploading, open a serial session at the sketch's baud rate and serial_expect the new marker (opening the port resets most AVR boards). An old marker means old code. Report only what the serial output proves.`;
+Verifying code: sketches should print a boot marker at the end of setup(), e.g. Serial.println("BOOT <name> v3"); bump it on every change. "Upload OK" does not prove the new code runs: after uploading, open a serial session at the sketch's baud rate and serial_expect the new marker (opening the port resets most AVR boards). An old marker means old code. Report only what the serial output proves.
+
+Uploading: upload_sketch and upload_and_wait_ready compile the current source first, so a separate compile_sketch call is not needed; compile=false re-uploads the last build and is flagged UPLOAD_WITHOUT_COMPILE.
+
+Logging: to watch a sketch for a while (e.g. 5 minutes of sensor readings), open a session and call serial_record with durationMs and, for analysis, saveTo; don't chain serial_expect timeouts. If a session ends unexpectedly (SESSION_DISCONNECTED), the error says whether the port is still present; serial_read still returns what arrived before it ended.`;
 
 const server = new McpServer(
   {
@@ -1515,6 +1527,112 @@ server.registerTool(
   }
 );
 
+interface CompileStep {
+  raw: CommandResult;
+  errors: Diagnostic[];
+  warnings: Diagnostic[];
+  memory: MemoryUse | null;
+}
+
+/** Run arduino-cli compile and parse its output. Shared by compile_sketch and the upload tools. */
+async function runCompileStep(opts: {
+  sketchPath: string;
+  fqbn: string;
+  buildPath?: string;
+  exportBinaries?: boolean;
+  clean?: boolean;
+  warnings?: string;
+}): Promise<CompileStep> {
+  const args = ["compile", opts.sketchPath, "--fqbn", opts.fqbn];
+  if (opts.buildPath) {
+    args.push("--build-path", resolveSketchPath(opts.buildPath, arduinoConfig.sketchRoot));
+  }
+  if (opts.exportBinaries) {
+    args.push("--export-binaries");
+  }
+  if (opts.clean) {
+    args.push("--clean");
+  }
+  if (opts.warnings) {
+    args.push("--warnings", opts.warnings);
+  }
+  const raw = await runArduinoCli(arduinoConfig, args, 300_000);
+  const diagnostics = parseDiagnostics(raw.stderr);
+  return {
+    raw,
+    errors: diagnostics.filter((d) => d.severity === "error"),
+    warnings: diagnostics.filter((d) => d.severity === "warning"),
+    memory: parseMemoryUse(raw.stdout)
+  };
+}
+
+function compileFailureMessage(step: CompileStep): string {
+  const first = step.errors[0];
+  return first
+    ? `Sketch compilation failed with ${step.errors.length} error(s); first: ${first.file.split("/").pop()}:${first.line}: ${first.message}`
+    : withCliHint("Sketch compilation failed.", step.raw);
+}
+
+const compileBeforeUploadSchema = z
+  .boolean()
+  .optional()
+  .describe(
+    "Compile the current source before uploading (default true), so the board never gets an older build. Set false only to re-upload the last build on purpose."
+  );
+
+/**
+ * Compile step of the upload tools. Returns a tool result to send back when the upload must not go
+ * ahead (no FQBN, or compile errors), otherwise the compile output.
+ */
+async function compileBeforeUpload(
+  command: string,
+  sketchPath: string,
+  fqbn: string | undefined
+): Promise<{ step: CompileStep } | { refusal: ReturnType<typeof toToolResult> }> {
+  if (!fqbn) {
+    return {
+      refusal: toToolResult(
+        {
+          ok: false,
+          status: "error",
+          command,
+          stage: "compile",
+          errorCode: "COMPILE_NEEDS_FQBN",
+          error:
+            "Compiling before upload needs an FQBN: pass fqbn or set FQBN in tools/board.env. Nothing was uploaded.",
+          nextActions: ["Pass compile=false only if you really want to upload the last build without recompiling."]
+        },
+        true
+      )
+    };
+  }
+  const step = await runCompileStep({ sketchPath, fqbn });
+  if (!step.raw.ok) {
+    return {
+      refusal: toToolResult(
+        {
+          ok: false,
+          status: "error",
+          command,
+          stage: "compile",
+          errorCode: "COMPILE_FAILED",
+          data: { sketchPath, fqbn, errors: step.errors, warnings: step.warnings },
+          raw: step.raw,
+          error: `${compileFailureMessage(step).replace(/\.?$/, ".")} Nothing was uploaded.`
+        },
+        true
+      )
+    };
+  }
+  return { step };
+}
+
+function compileSummary(step: CompileStep | null) {
+  return step
+    ? { compiled: true, memory: step.memory, warningCount: step.warnings.length, durationMs: step.raw.durationMs }
+    : { compiled: false };
+}
+
 server.registerTool(
   "compile_sketch",
   {
@@ -1582,35 +1700,19 @@ server.registerTool(
         );
       }
 
-      const args = ["compile", resolvedSketchPath, "--fqbn", fqbn];
-
-      if (buildPath) {
-        args.push("--build-path", resolveSketchPath(buildPath, arduinoConfig.sketchRoot));
-      }
-      if (exportBinaries) {
-        args.push("--export-binaries");
-      }
-      if (clean) {
-        args.push("--clean");
-      }
-      if (warnings) {
-        args.push("--warnings", warnings);
-      }
-
-      const raw = await runArduinoCli(arduinoConfig, args, 300_000);
-      const diagnostics = parseDiagnostics(raw.stderr);
-      const errors = diagnostics.filter((d) => d.severity === "error");
+      const step = await runCompileStep({ sketchPath: resolvedSketchPath, fqbn, buildPath, exportBinaries, clean, warnings });
+      const raw = step.raw;
       return toToolResult(
         {
           ok: raw.ok,
-          status: raw.ok ? (diagnostics.some((d) => d.severity === "warning") ? "warning" : "ok") : "error",
+          status: raw.ok ? (step.warnings.length > 0 ? "warning" : "ok") : "error",
           command: "compile",
           data: {
             sketchPath: resolvedSketchPath,
             fqbn,
-            memory: parseMemoryUse(raw.stdout),
-            errors,
-            warnings: diagnostics.filter((d) => d.severity === "warning"),
+            memory: step.memory,
+            errors: step.errors,
+            warnings: step.warnings,
             project: configSummary(targets.config),
             coreId,
             coreEnsure: coreEnsure
@@ -1622,11 +1724,7 @@ server.registerTool(
               : null
           },
           raw,
-          error: raw.ok
-            ? undefined
-            : errors.length > 0
-              ? `Sketch compilation failed with ${errors.length} error(s); first: ${errors[0].file.split("/").pop()}:${errors[0].line}: ${errors[0].message}`
-              : withCliHint("Sketch compilation failed.", raw)
+          error: raw.ok ? undefined : compileFailureMessage(step)
         },
         !raw.ok
       );
@@ -1641,7 +1739,7 @@ server.registerTool(
   {
     title: "Upload Sketch",
     description:
-      "Upload a compiled sketch to a connected board/port. sketchPath, port and fqbn default to tools/board.env. Refuses until it is known what the board's outputs drive (OUTPUTS); mains needs confirmMains for every upload.",
+      "Compile the current source and upload it to a connected board/port (compile=false re-uploads the last build instead). sketchPath, port and fqbn default to tools/board.env. Refuses until it is known what the board's outputs drive (OUTPUTS); mains needs confirmMains for every upload.",
     inputSchema: {
       projectDir: projectDirSchema,
       sketchPath: z.string().optional().describe("Path to sketch folder or .ino file. Default: SKETCH_DIR."),
@@ -1649,6 +1747,7 @@ server.registerTool(
       fqbn: z.string().optional().describe("Board FQBN. Default: FQBN."),
       outputs: outputsSchema,
       confirmMains: confirmMainsSchema,
+      compile: compileBeforeUploadSchema,
       verify: z.boolean().optional().describe("Verify uploaded binary when supported."),
       autoInstallCore: z
         .boolean()
@@ -1719,6 +1818,7 @@ server.registerTool(
     fqbn: fqbnArg,
     outputs,
     confirmMains = false,
+    compile = true,
     verify,
     autoInstallCore = true,
     unsafeSkipPreflight = false,
@@ -1823,6 +1923,15 @@ server.registerTool(
           );
         }
 
+        let compileStep: CompileStep | null = null;
+        if (compile) {
+          const compiled = await compileBeforeUpload("upload", resolvedSketchPath, fqbn);
+          if ("refusal" in compiled) {
+            return compiled.refusal;
+          }
+          compileStep = compiled.step;
+        }
+
         const args = ["upload", resolvedSketchPath, "-p", port];
         if (fqbn) {
           args.push("--fqbn", fqbn);
@@ -1832,11 +1941,15 @@ server.registerTool(
         }
 
         const raw = await runArduinoCli(arduinoConfig, args, 300_000);
+        const reasonCodes = [
+          ...(safetyGate.skipped ? ["SAFETY_PREFLIGHT_SKIPPED"] : safetyGate.safety?.reasonCodes ?? []),
+          ...(compile ? [] : ["UPLOAD_WITHOUT_COMPILE"])
+        ];
         return toToolResult(
           {
             ok: raw.ok,
             status: raw.ok
-              ? safetyGate.skipped
+              ? safetyGate.skipped || !compile
                 ? "warning"
                 : safetyGate.safety?.status === "pass_with_warnings"
                   ? "warning"
@@ -1845,15 +1958,14 @@ server.registerTool(
             command: "upload",
             stage: "upload",
             errorCode: raw.ok ? undefined : "UPLOAD_FAILED",
-            reasonCodes: safetyGate.skipped
-              ? ["SAFETY_PREFLIGHT_SKIPPED"]
-              : safetyGate.safety?.reasonCodes ?? undefined,
+            reasonCodes: reasonCodes.length > 0 ? reasonCodes : undefined,
             data: {
               sketchPath: resolvedSketchPath,
               port,
               fqbn: fqbn ?? null,
               project: configSummary(targets.config),
               outputs: outputs ?? targets.config?.outputs ?? null,
+              compile: compileSummary(compileStep),
               coreId,
               safety: safetySummary(safetyGate),
               coreEnsure: coreEnsure
@@ -1866,6 +1978,9 @@ server.registerTool(
             },
             nextActions: raw.ok
               ? [
+                  ...(compile
+                    ? []
+                    : ["compile=false uploaded the last build, which may be older than the source."]),
                   "Upload OK does not prove the new code runs: open serial_open_session at the sketch's baud rate and serial_expect the new boot marker."
                 ]
               : ["Verify board port/FQBN and retry upload.", "Run detect_hardware if port mapping changed."],
@@ -1888,7 +2003,7 @@ server.registerTool(
   {
     title: "Upload And Wait Ready",
     description:
-      "Upload a sketch and wait for a serial readiness pattern, handling post-upload reset/re-enumeration windows. sketchPath, port, fqbn and readyBaudRate default to tools/board.env. Same OUTPUTS rule as upload_sketch.",
+      "Compile the current source, upload it and wait for a serial readiness pattern, handling post-upload reset/re-enumeration windows (compile=false re-uploads the last build instead). sketchPath, port, fqbn and readyBaudRate default to tools/board.env. Same OUTPUTS rule as upload_sketch.",
     inputSchema: {
       projectDir: projectDirSchema,
       sketchPath: z.string().optional().describe("Path to sketch folder or .ino file. Default: SKETCH_DIR."),
@@ -1896,6 +2011,7 @@ server.registerTool(
       fqbn: z.string().optional().describe("Board FQBN. Default: FQBN."),
       outputs: outputsSchema,
       confirmMains: confirmMainsSchema,
+      compile: compileBeforeUploadSchema,
       verify: z.boolean().optional().describe("Verify uploaded binary when supported."),
       autoInstallCore: z
         .boolean()
@@ -1969,6 +2085,7 @@ server.registerTool(
     fqbn: fqbnArg,
     outputs,
     confirmMains = false,
+    compile = true,
     verify,
     autoInstallCore = true,
     readyPattern,
@@ -2060,6 +2177,15 @@ server.registerTool(
           );
         }
 
+        let compileStep: CompileStep | null = null;
+        if (compile) {
+          const compiled = await compileBeforeUpload("upload_and_wait_ready", resolvedSketchPath, fqbn);
+          if ("refusal" in compiled) {
+            return compiled.refusal;
+          }
+          compileStep = compiled.step;
+        }
+
         const uploadArgs = ["upload", resolvedSketchPath, "-p", port];
         if (fqbn) {
           uploadArgs.push("--fqbn", fqbn);
@@ -2094,23 +2220,26 @@ server.registerTool(
           });
           readyMatched = capture.matched;
         }
-        const uploadMemory = parseMemoryUse(uploadRaw.stdout);
+        const uploadMemory = compileStep?.memory ?? parseMemoryUse(uploadRaw.stdout);
+        const reasonCodes = [
+          ...(safetyGate.skipped ? ["SAFETY_PREFLIGHT_SKIPPED"] : safetyGate.safety?.reasonCodes ?? []),
+          ...(compile ? [] : ["UPLOAD_WITHOUT_COMPILE"])
+        ];
 
         return toToolResult(
           {
             ok: readyMatched,
-            status: readyMatched ? "ok" : "error",
+            status: readyMatched ? (compile ? "ok" : "warning") : "error",
             command: "upload_and_wait_ready",
             stage: readyPattern ? "wait_ready" : "upload",
             errorCode: readyMatched ? undefined : "READY_PATTERN_TIMEOUT",
-            reasonCodes: safetyGate.skipped
-              ? ["SAFETY_PREFLIGHT_SKIPPED"]
-              : safetyGate.safety?.reasonCodes ?? undefined,
+            reasonCodes: reasonCodes.length > 0 ? reasonCodes : undefined,
             data: {
               sketchPath: resolvedSketchPath,
               port,
               fqbn: fqbn ?? null,
               project: configSummary(targets.config),
+              compile: compileSummary(compileStep),
               readyPattern: readyPattern ?? null,
               readyBaudRate,
               readyMatched,
@@ -2123,7 +2252,9 @@ server.registerTool(
             },
             rawTail: capture?.stderr ? { stderr: tail(capture.stderr, 1000) } : undefined,
             nextActions: readyMatched
-              ? undefined
+              ? compile
+                ? undefined
+                : ["compile=false uploaded the last build, which may be older than the source."]
               : [
                   "Check that the sketch prints the pattern at this baud rate (Serial.begin), and that no other program holds the port.",
                   "An old boot marker in serialLines means the old code is still running."
@@ -2455,7 +2586,8 @@ server.registerTool(
   "serial_read",
   {
     title: "Serial Read",
-    description: "Read buffered bytes from an open serial session.",
+    description:
+      "Read buffered bytes from a serial session. Also works for up to 10 minutes after the session ended (closed, expired or board disconnected), returning what arrived before it ended.",
     inputSchema: {
       sessionId: z.string(),
       fromOffset: z.number().int().min(0).optional().describe("Read offset cursor. Defaults to current buffer start."),
@@ -2474,7 +2606,8 @@ server.registerTool(
       return toToolResult(
         {
           ok: result.ok,
-          status: result.ok ? "ok" : "error",
+          status: result.ok ? (result.endedNote ? "warning" : "ok") : "error",
+          note: result.endedNote,
           command: "serial_read",
           stage: "serial_session_read",
           errorCode: result.errorCode,
@@ -2546,6 +2679,138 @@ server.registerTool(
             matchIndex: result.matchIndex ?? null,
             fromOffset: result.fromOffset ?? null,
             timeoutMs: result.timeoutMs ?? timeoutMs
+          },
+          error: result.error
+        },
+        !result.ok
+      );
+    } catch (error) {
+      return toUnhandledError(error);
+    }
+  }
+);
+
+server.registerTool(
+  "serial_record",
+  {
+    title: "Serial Record",
+    description:
+      `Record everything an open serial session receives for durationMs (up to ${MAX_RECORD_MS / 60_000} min), keeping the session alive meanwhile, and return the lines. Use it for logging runs instead of chaining serial_expect timeouts. saveTo writes every line to a file for analysis. Long recordings may be moved to the background by the client; the result arrives when it finishes.`,
+    inputSchema: {
+      sessionId: z.string(),
+      durationMs: z
+        .number()
+        .int()
+        .min(1_000)
+        .max(MAX_RECORD_MS)
+        .optional()
+        .describe("How long to record. Default 60000."),
+      includeBuffered: z
+        .boolean()
+        .optional()
+        .describe(
+          "Also include data already buffered before this call, e.g. the boot output right after serial_open_session. Default false: only data arriving during the recording."
+        ),
+      fromOffset: z.number().int().min(0).optional().describe("Explicit start offset; overrides includeBuffered."),
+      saveTo: z
+        .string()
+        .refine((p) => path.isAbsolute(p), "saveTo must be an absolute path.")
+        .optional()
+        .describe("Absolute path of a text file to write every recorded line to."),
+      overwrite: z.boolean().optional().describe("Allow saveTo to replace an existing file. Default false."),
+      maxLines: z
+        .number()
+        .int()
+        .min(1)
+        .max(5_000)
+        .optional()
+        .describe("Most recent lines to return in the result (default 400); saveTo always gets all of them.")
+    },
+    outputSchema: toolOutputShape,
+    annotations: {
+      readOnlyHint: true,
+      openWorldHint: false
+    }
+  },
+  async ({ sessionId, durationMs = 60_000, includeBuffered = false, fromOffset, saveTo, overwrite = false, maxLines = 400 }) => {
+    try {
+      if (saveTo && !overwrite && fs.existsSync(saveTo)) {
+        return toToolResult(
+          {
+            ok: false,
+            status: "error",
+            command: "serial_record",
+            stage: "validate",
+            errorCode: "SAVE_TARGET_EXISTS",
+            error: `${saveTo} already exists. Pass overwrite=true to replace it, or choose another path. Nothing was recorded.`
+          },
+          true
+        );
+      }
+
+      const startOffset =
+        fromOffset ?? (includeBuffered ? serialSessionManager.getSessionSummary(sessionId)?.bufferStartOffset ?? null : null);
+      const result = await serialSessionManager.recordSession(sessionId, durationMs, startOffset);
+      if (result.text === undefined) {
+        return toToolResult(
+          {
+            ok: false,
+            status: "error",
+            command: "serial_record",
+            stage: "serial_session_record",
+            errorCode: result.errorCode,
+            reasonCodes: result.errorCode ? [result.errorCode] : undefined,
+            data: { session: result.session ?? null },
+            error: result.error
+          },
+          true
+        );
+      }
+
+      const lines = serialLines(result.text);
+      let savedTo: string | null = null;
+      if (saveTo) {
+        fs.mkdirSync(path.dirname(saveTo), { recursive: true });
+        fs.writeFileSync(saveTo, lines.length > 0 ? `${lines.join("\n")}\n` : "");
+        savedTo = saveTo;
+      }
+      const returned = lines.slice(-maxLines);
+      const notes: string[] = [];
+      if (result.bytes === 0) {
+        notes.push("No serial data arrived: check the baud rate and that the sketch prints.");
+      }
+      if (result.truncated) {
+        notes.push("The buffer had already dropped part of the requested data: open the session with a larger maxBufferBytes.");
+      }
+      if (returned.length < lines.length) {
+        notes.push(
+          `Returned the last ${returned.length} of ${lines.length} lines${savedTo ? `; all lines are in ${savedTo}` : " (use saveTo to keep them all)"}.`
+        );
+      }
+
+      return toToolResult(
+        {
+          ok: result.ok,
+          status: !result.ok ? "error" : notes.length > 0 ? "warning" : "ok",
+          command: "serial_record",
+          stage: "serial_session_record",
+          errorCode: result.errorCode,
+          reasonCodes: result.errorCode ? [result.errorCode] : undefined,
+          note: notes.length > 0 ? notes.join(" ") : undefined,
+          data: {
+            session: result.session ?? null,
+            requestedMs: result.requestedMs,
+            durationMs: result.durationMs,
+            endedEarly: result.endedEarly,
+            bytes: result.bytes,
+            startOffset: result.startOffset,
+            nextOffset: result.nextOffset,
+            truncated: result.truncated,
+            lineCount: lines.length,
+            omittedLines: lines.length - returned.length,
+            bootMarker: findBootMarker(result.text),
+            savedTo,
+            lines: returned
           },
           error: result.error
         },
