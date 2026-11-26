@@ -3,7 +3,7 @@
   "manifest_version": "0.3",
   "name": "arduino-mcp-server",
   "display_name": "Arduino MCP Server",
-  "version": "0.2.9",
+  "version": "0.2.12",
   "description": "MCP server for Arduino CLI setup, board detection, compile/upload workflows, serial sessions, and board reference lookup.",
   "long_description": "Arduino MCP Server provides safe, structured access to arduino-cli for setup, board detection, compile/upload, serial monitoring, and board metadata workflows.",
   "author": {
@@ -48,7 +48,8 @@
       ],
       "env": {
         "ARDUINO_CLI_PATH": "${user_config.arduino_cli_path}",
-        "ARDUINO_SKETCH_ROOT": "${user_config.arduino_sketch_root}"
+        "ARDUINO_SKETCH_ROOT": "${user_config.arduino_sketch_root}",
+        "ARDUINO_USER_DIR": "${user_config.arduino_user_dir}"
       }
     }
   },
@@ -64,6 +65,12 @@
       "type": "directory",
       "title": "Sketch Root",
       "description": "Optional absolute directory that limits sketch compile/upload paths.",
+      "required": false
+    },
+    "arduino_user_dir": {
+      "type": "directory",
+      "title": "Arduino Library Folder",
+      "description": "Optional folder used as the arduino-cli user directory (sketchbook and installed libraries). Use a folder outside ~/Documents if the extension cannot read Documents on macOS.",
       "required": false
     }
   },
@@ -83,6 +90,10 @@
     {
       "name": "ensure_core_installed",
       "description": "Ensure the required Arduino core is installed, with optional automatic installation."
+    },
+    {
+      "name": "install_libraries",
+      "description": "Install Arduino libraries (default: LIBS from tools/board.env)."
     },
     {
       "name": "compile_sketch",

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
 
 export interface CommandResult {
@@ -35,6 +36,27 @@ export function resolveSketchPath(inputPath: string, sketchRoot?: string): strin
   throw new Error(`Path "${resolved}" is outside ARDUINO_SKETCH_ROOT "${root}".`);
 }
 
+/**
+ * The Arduino "user" directory (sketchbook, where `lib install` puts libraries), from ARDUINO_USER_DIR.
+ * Lets the server use a folder it can read: on macOS an app-launched process may not be allowed into
+ * ~/Documents, where arduino-cli keeps libraries by default. Empty or an unfilled "${...}" template
+ * (an optional extension setting left blank) means "not set". A leading ~ is expanded.
+ */
+export function arduinoUserDir(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const raw = env.ARDUINO_USER_DIR?.trim();
+  if (!raw || raw.includes("${")) {
+    return undefined;
+  }
+  const expanded = raw === "~" ? os.homedir() : raw.startsWith("~/") ? path.join(os.homedir(), raw.slice(2)) : raw;
+  return path.resolve(expanded);
+}
+
+/** Environment for child processes: passes ARDUINO_USER_DIR to arduino-cli as ARDUINO_DIRECTORIES_USER. */
+export function childEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const userDir = arduinoUserDir(env);
+  return userDir ? { ...env, ARDUINO_DIRECTORIES_USER: userDir } : { ...env };
+}
+
 export async function runArduinoCli(
   config: ArduinoCliConfig,
   args: string[],
@@ -52,7 +74,8 @@ export async function runCommand(
 
   return await new Promise<CommandResult>((resolve) => {
     const child = spawn(command, args, {
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      env: childEnv()
     });
 
     let stdout = "";
@@ -143,7 +166,8 @@ export async function captureMonitor(
     attempts += 1;
     await new Promise<void>((resolve) => {
       const child = spawn(cliPath, ["monitor", "-p", port, "-c", `baudrate=${Math.floor(baudRate)}`, "--quiet"], {
-        stdio: ["pipe", "pipe", "pipe"]
+        stdio: ["pipe", "pipe", "pipe"],
+        env: childEnv()
       });
       const timer = setTimeout(() => child.kill(), Math.max(deadline - Date.now(), 0));
       child.stdout.on("data", (chunk: Buffer) => {

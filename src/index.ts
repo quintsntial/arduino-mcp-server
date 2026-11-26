@@ -12,6 +12,7 @@ import {
   type BoardReference
 } from "./boardReference.js";
 import {
+  arduinoUserDir,
   captureMonitor,
   type MonitorCapture,
   resolveSketchPath,
@@ -44,8 +45,13 @@ import {
   type MemoryUse
 } from "./output.js";
 
-const cliPathFromEnv = process.env.ARDUINO_CLI_PATH?.trim();
-const sketchRootFromEnv = process.env.ARDUINO_SKETCH_ROOT?.trim();
+// An optional extension setting left blank can arrive as its unfilled "${user_config...}" template: treat as unset.
+const envSetting = (name: string): string | undefined => {
+  const value = process.env[name]?.trim();
+  return value && !value.includes("${") ? value : undefined;
+};
+const cliPathFromEnv = envSetting("ARDUINO_CLI_PATH");
+const sketchRootFromEnv = envSetting("ARDUINO_SKETCH_ROOT");
 
 const arduinoConfig: ArduinoCliConfig = {
   cliPath: cliPathFromEnv && cliPathFromEnv.length > 0 ? cliPathFromEnv : "arduino-cli",
@@ -1008,6 +1014,7 @@ server.registerTool(
         command: "version",
         data: {
           cliPath: arduinoConfig.cliPath,
+          userDirectory: arduinoUserDir() ?? "arduino-cli default (ARDUINO_USER_DIR not set)",
           platform: process.platform,
           arch: process.arch,
           requiredDependency: {
@@ -1234,6 +1241,63 @@ server.registerTool(
           error: raw.ok ? undefined : withCliHint("arduino-cli board listall failed.", raw)
         },
         !raw.ok
+      );
+    } catch (error) {
+      return toUnhandledError(error);
+    }
+  }
+);
+
+server.registerTool(
+  "install_libraries",
+  {
+    title: "Install Libraries",
+    description:
+      "Install Arduino libraries with `arduino-cli lib install`. libraries defaults to LIBS in tools/board.env. " +
+      "Installs into ARDUINO_USER_DIR when that is set (see arduino_cli_doctor userDirectory).",
+    inputSchema: {
+      libraries: z
+        .array(z.string().min(1))
+        .optional()
+        .describe("Library Manager names, e.g. [\"DHTlib\", \"Adafruit NeoPixel\"]. Default: LIBS."),
+      projectDir: projectDirSchema,
+      sketchPath: z.string().optional().describe("Optional sketch path to find the project from.")
+    },
+    outputSchema: toolOutputShape,
+    annotations: {
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true
+    }
+  },
+  async ({ libraries, projectDir, sketchPath }) => {
+    try {
+      const config = libraries && libraries.length > 0 ? null : loadProjectConfig({ projectDir, sketchPath });
+      const names = libraries && libraries.length > 0 ? libraries : config?.libs ?? [];
+      if (names.length === 0) {
+        return toToolResult(
+          {
+            ok: false,
+            command: "install_libraries",
+            error: "No libraries given and no LIBS in tools/board.env."
+          },
+          true
+        );
+      }
+      const results: Array<{ library: string; ok: boolean; output: string }> = [];
+      for (const name of names) {
+        const raw = await runArduinoCli(arduinoConfig, ["lib", "install", name], 180_000);
+        results.push({ library: name, ok: raw.ok, output: (raw.stdout + "\n" + raw.stderr).trim().slice(-400) });
+      }
+      const failed = results.filter((r) => !r.ok).map((r) => r.library);
+      return toToolResult(
+        {
+          ok: failed.length === 0,
+          command: "lib install",
+          data: { userDirectory: arduinoUserDir() ?? "arduino-cli default", results },
+          error: failed.length > 0 ? `Failed to install: ${failed.join(", ")}` : undefined
+        },
+        failed.length > 0
       );
     } catch (error) {
       return toUnhandledError(error);
@@ -1542,6 +1606,7 @@ async function runCompileStep(opts: {
   exportBinaries?: boolean;
   clean?: boolean;
   warnings?: string;
+  verbose?: boolean;
 }): Promise<CompileStep> {
   const args = ["compile", opts.sketchPath, "--fqbn", opts.fqbn];
   if (opts.buildPath) {
@@ -1555,6 +1620,9 @@ async function runCompileStep(opts: {
   }
   if (opts.warnings) {
     args.push("--warnings", opts.warnings);
+  }
+  if (opts.verbose) {
+    args.push("--verbose");
   }
   const raw = await runArduinoCli(arduinoConfig, args, 300_000);
   const diagnostics = parseDiagnostics(raw.stderr);
@@ -1647,6 +1715,10 @@ server.registerTool(
       clean: z.boolean().optional().describe("If true, clean build cache before compile."),
       buildPath: z.string().optional().describe("Optional build output directory."),
       warnings: z.enum(["none", "default", "more", "all"]).optional(),
+      verbose: z
+        .boolean()
+        .optional()
+        .describe("If true, pass --verbose: shows every build command. Use when a build fails without compiler messages."),
       autoInstallCore: z
         .boolean()
         .optional()
@@ -1659,7 +1731,7 @@ server.registerTool(
       openWorldHint: false
     }
   },
-  async ({ projectDir, sketchPath: sketchPathArg, fqbn: fqbnArg, exportBinaries, clean, buildPath, warnings, autoInstallCore = true }) => {
+  async ({ projectDir, sketchPath: sketchPathArg, fqbn: fqbnArg, exportBinaries, clean, buildPath, warnings, verbose, autoInstallCore = true }) => {
     try {
       const targets = resolveTargets({ projectDir, sketchPath: sketchPathArg, fqbn: fqbnArg }, ["sketchPath", "fqbn"]);
       if (targets.missing.length > 0) {
@@ -1700,8 +1772,15 @@ server.registerTool(
         );
       }
 
-      const step = await runCompileStep({ sketchPath: resolvedSketchPath, fqbn, buildPath, exportBinaries, clean, warnings });
+      const step = await runCompileStep({ sketchPath: resolvedSketchPath, fqbn, buildPath, exportBinaries, clean, warnings, verbose });
       const raw = step.raw;
+      // A build that fails without any compiler message: rerun once with --verbose and keep the tail,
+      // so the failing build command is visible without a second tool call.
+      let verboseTail: string | undefined;
+      if (!raw.ok && step.errors.length === 0 && !verbose) {
+        const again = await runCompileStep({ sketchPath: resolvedSketchPath, fqbn, buildPath, exportBinaries, clean: false, warnings, verbose: true });
+        verboseTail = `${again.raw.stdout}\n${again.raw.stderr}`.trim().split("\n").slice(-60).join("\n");
+      }
       return toToolResult(
         {
           ok: raw.ok,
@@ -1714,6 +1793,7 @@ server.registerTool(
             errors: step.errors,
             warnings: step.warnings,
             project: configSummary(targets.config),
+            ...(verboseTail ? { verboseTail } : {}),
             coreId,
             coreEnsure: coreEnsure
               ? {

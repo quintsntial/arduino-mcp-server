@@ -1,8 +1,8 @@
 .git
 .github
 _ref_mcp_servers
-src
-dist
+/src
+/dist
 tsconfig.json
 .npm-cache
 node_modules/.package-lock
