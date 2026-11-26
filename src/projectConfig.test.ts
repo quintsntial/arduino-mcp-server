@@ -7,7 +7,9 @@ import {
   checkBaud,
   checkOutputsGate,
   findBoardEnv,
+  isEnabled,
   loadProjectConfig,
+  readProjectConfig,
   parseBoardEnv,
   resolveTargets
 } from "./projectConfig.js";
@@ -129,5 +131,34 @@ describe("checkBaud", () => {
   test("refuses 1200 baud, allows normal rates", () => {
     assert.equal(checkBaud(1200).errorCode, "BAUD_1200_REFUSED");
     assert.equal(checkBaud(9600).ok, true);
+  });
+});
+
+describe("firmware backup settings", () => {
+  let root: string;
+  before(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "board-env-backup-"));
+    fs.mkdirSync(path.join(root, "tools"));
+  });
+  after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const write = (text: string) => {
+    const file = path.join(root, "tools", "board.env");
+    fs.writeFileSync(file, text);
+    return readProjectConfig(file);
+  };
+
+  test("BACKUP_DIR defaults to <project>/backups and resolves against the project root", () => {
+    assert.equal(write("FQBN=arduino:avr:nano\n").backupDir, path.join(root, "backups"));
+    assert.equal(write("BACKUP_DIR=fw/images\n").backupDir, path.join(root, "fw", "images"));
+    assert.equal(write("BACKUP_DIR=/abs/backups\n").backupDir, "/abs/backups");
+  });
+
+  test("BACKUP_BEFORE_UPLOAD is off unless set to 1/true/yes/on", () => {
+    assert.equal(write("FQBN=x:y:z\n").backupBeforeUpload, false);
+    assert.equal(write("BACKUP_BEFORE_UPLOAD=1\n").backupBeforeUpload, true);
+    assert.equal(write("BACKUP_BEFORE_UPLOAD=0\n").backupBeforeUpload, false);
+    assert.equal(isEnabled(" Yes "), true);
+    assert.equal(isEnabled("no"), false);
   });
 });

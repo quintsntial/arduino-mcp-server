@@ -80,6 +80,8 @@ Requires [arduino-cli](https://arduino.github.io/arduino-cli/) on your PATH, or 
 | `compile_sketch` | Compile a sketch for a target board |
 | `upload_sketch` | Compile the current source and upload it to a board |
 | `upload_and_wait_ready` | Compile, upload and wait for device ready signal |
+| `backup_firmware` | Read a board's whole flash (AVR: avrdude, Intel HEX; ESP8266/ESP32: esptool, .bin) plus a JSON sidecar |
+| `restore_firmware` | Write a backup back (same gates as upload; refuses another board family, MCU or flash size; verifies) |
 | `serial_open_session` | Open a stateful serial session |
 | `serial_read` | Read buffered serial data (also after the session ended) |
 | `serial_expect` | Wait for a pattern in serial output |
@@ -93,6 +95,16 @@ Requires [arduino-cli](https://arduino.github.io/arduino-cli/) on your PATH, or 
 | `list_supported_boards` | List all boards arduino-cli supports |
 | `list_board_reference` | Browse board pin reference |
 | `search_board_reference` | Search board reference by keyword |
+
+### Firmware backups
+
+`backup_firmware` saves the flash to `BACKUP_DIR` from `tools/board.env` (default `<project>/backups/`, or pass
+`backupDir`) and writes a `.gitignore` (`*`) there: ESP images usually contain the saved Wi-Fi name and password in
+plain text. The sidecar records FQBN, port, USB VID/PID, chip/flash id (MAC for ESP), flash size, sha256, the tool and
+its version. With `BACKUP_BEFORE_UPLOAD=1` in `tools/board.env`, `upload_sketch` and `upload_and_wait_ready` refuse
+until a backup of the connected board exists (ESP: matched by MAC; AVR: by FQBN + port + USB VID/PID, which any board
+of the same type on that port also passes), unless the call passes `backupOverrideApproved=true` after the user
+approved it. Erasing flash, fuses/eFuses and bootloaders are out of scope.
 
 **Resources:**
 - `arduino://boards/reference` — structured board pin/capability reference

@@ -7,12 +7,25 @@
 //   BAUD         serial speed, must match Serial.begin (default 9600)
 //   LIBS, CORE, BOARD_URLS   setup info (comma separated lists)
 //   OUTPUTS      what the board's outputs drive: leds | low-voltage | mains
+//   BACKUP_DIR   where backup_firmware saves images, relative to the project root (default backups/)
+//   BACKUP_BEFORE_UPLOAD  1 = uploads refuse until a firmware backup of the connected board exists
 
 import fs from "node:fs";
 import path from "node:path";
 
 export const BOARD_ENV_RELATIVE_PATH = path.join("tools", "board.env");
-const KNOWN_KEYS = new Set(["SKETCH_DIR", "FQBN", "PORT", "BAUD", "LIBS", "CORE", "BOARD_URLS", "OUTPUTS"]);
+const KNOWN_KEYS = new Set([
+  "SKETCH_DIR",
+  "FQBN",
+  "PORT",
+  "BAUD",
+  "LIBS",
+  "CORE",
+  "BOARD_URLS",
+  "OUTPUTS",
+  "BACKUP_DIR",
+  "BACKUP_BEFORE_UPLOAD"
+]);
 export const OUTPUT_KINDS = ["leds", "low-voltage", "mains"] as const;
 export type OutputsKind = (typeof OUTPUT_KINDS)[number];
 
@@ -28,6 +41,8 @@ export interface ProjectConfig {
   core?: string;
   boardUrls: string[];
   outputs?: OutputsKind;
+  backupDir: string; // BACKUP_DIR resolved against the project root, default <project>/backups
+  backupBeforeUpload: boolean;
   problems: string[]; // values present but invalid
 }
 
@@ -80,6 +95,11 @@ export function findBoardEnv(startPath: string): string | null {
   }
 }
 
+/** board.env switch values: 1, true, yes, on (any case) mean enabled. */
+export function isEnabled(value: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test((value ?? "").trim());
+}
+
 const splitList = (value: string | undefined) =>
   (value ?? "")
     .split(",")
@@ -123,6 +143,8 @@ export function readProjectConfig(boardEnvPath: string): ProjectConfig {
     core: values.CORE,
     boardUrls: splitList(values.BOARD_URLS),
     outputs,
+    backupDir: path.resolve(projectDir, values.BACKUP_DIR ?? "backups"),
+    backupBeforeUpload: isEnabled(values.BACKUP_BEFORE_UPLOAD),
     problems
   };
 }

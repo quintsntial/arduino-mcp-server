@@ -24,6 +24,7 @@ import {
 } from "./arduinoCli.js";
 import { PortOperationCoordinator } from "./portCoordinator.js";
 import { MAX_RECORD_MS, SerialSessionManager } from "./serialSessions.js";
+import { backupFirmware, checkBackupGate, restoreFirmware, type FirmwareDeps } from "./firmware.js";
 import { runSafetyPreflight, type BatterySpec, type PowerSpec, type WiringSignal } from "./safety.js";
 import {
   OUTPUT_KINDS,
@@ -817,6 +818,61 @@ const confirmMainsSchema = z
   .boolean()
   .optional()
   .describe("Required when outputs switch mains/heaters/motors: true only after the user approved THIS upload.");
+
+const firmwareDeps: FirmwareDeps = { run: runCommand, cliPath: arduinoConfig.cliPath };
+
+/** Backup folder: explicit argument, else BACKUP_DIR / <project>/backups from board.env. Kept inside ARDUINO_SKETCH_ROOT. */
+function backupDirFor(arg: string | undefined, config: ProjectConfig | null): string | undefined {
+  const dir = arg ?? config?.backupDir;
+  return dir ? resolveSketchPath(dir, arduinoConfig.sketchRoot) : undefined;
+}
+
+const backupOverrideSchema = z
+  .boolean()
+  .optional()
+  .describe(
+    "Only when BACKUP_BEFORE_UPLOAD=1 in board.env and no backup exists: true uploads anyway. Pass it only after the user explicitly approved uploading without a backup."
+  );
+
+/**
+ * BACKUP_BEFORE_UPLOAD gate of the upload tools. Returns a refusal to send back, or a summary for the
+ * result (null when the project does not require backups).
+ */
+async function backupGateForUpload(
+  command: string,
+  config: ProjectConfig | null,
+  fqbn: string | undefined,
+  port: string,
+  overrideApproved: boolean
+): Promise<{ refusal: ReturnType<typeof toToolResult> } | { summary: unknown }> {
+  if (!config?.backupBeforeUpload) {
+    return { summary: null };
+  }
+  if (overrideApproved) {
+    return { summary: { required: true, overriddenByUser: true } };
+  }
+  const gate = await checkBackupGate(firmwareDeps, { fqbn, port, backupDir: backupDirFor(undefined, config)! });
+  if (!gate.ok) {
+    return {
+      refusal: toToolResult(
+        {
+          ok: false,
+          status: "error",
+          command,
+          stage: "backup_check",
+          errorCode: gate.errorCode,
+          error: gate.error,
+          nextActions: [
+            "Run backup_firmware for this board first, then retry the upload.",
+            "Pass backupOverrideApproved=true only if the user explicitly approves uploading without a backup."
+          ]
+        },
+        true
+      )
+    };
+  }
+  return { summary: { required: true, matched: gate.matched, note: gate.note } };
+}
 
 function configSummary(config: ProjectConfig | null) {
   if (!config) {
@@ -1828,6 +1884,7 @@ server.registerTool(
       outputs: outputsSchema,
       confirmMains: confirmMainsSchema,
       compile: compileBeforeUploadSchema,
+      backupOverrideApproved: backupOverrideSchema,
       verify: z.boolean().optional().describe("Verify uploaded binary when supported."),
       autoInstallCore: z
         .boolean()
@@ -1899,6 +1956,7 @@ server.registerTool(
     outputs,
     confirmMains = false,
     compile = true,
+    backupOverrideApproved = false,
     verify,
     autoInstallCore = true,
     unsafeSkipPreflight = false,
@@ -2003,6 +2061,11 @@ server.registerTool(
           );
         }
 
+        const backupGate = await backupGateForUpload("upload", targets.config, fqbn, port, backupOverrideApproved);
+        if ("refusal" in backupGate) {
+          return backupGate.refusal;
+        }
+
         let compileStep: CompileStep | null = null;
         if (compile) {
           const compiled = await compileBeforeUpload("upload", resolvedSketchPath, fqbn);
@@ -2046,6 +2109,7 @@ server.registerTool(
               project: configSummary(targets.config),
               outputs: outputs ?? targets.config?.outputs ?? null,
               compile: compileSummary(compileStep),
+              backup: backupGate.summary,
               coreId,
               safety: safetySummary(safetyGate),
               coreEnsure: coreEnsure
@@ -2092,6 +2156,7 @@ server.registerTool(
       outputs: outputsSchema,
       confirmMains: confirmMainsSchema,
       compile: compileBeforeUploadSchema,
+      backupOverrideApproved: backupOverrideSchema,
       verify: z.boolean().optional().describe("Verify uploaded binary when supported."),
       autoInstallCore: z
         .boolean()
@@ -2166,6 +2231,7 @@ server.registerTool(
     outputs,
     confirmMains = false,
     compile = true,
+    backupOverrideApproved = false,
     verify,
     autoInstallCore = true,
     readyPattern,
@@ -2257,6 +2323,11 @@ server.registerTool(
           );
         }
 
+        const backupGate = await backupGateForUpload("upload_and_wait_ready", targets.config, fqbn, port, backupOverrideApproved);
+        if ("refusal" in backupGate) {
+          return backupGate.refusal;
+        }
+
         let compileStep: CompileStep | null = null;
         if (compile) {
           const compiled = await compileBeforeUpload("upload_and_wait_ready", resolvedSketchPath, fqbn);
@@ -2320,6 +2391,7 @@ server.registerTool(
               fqbn: fqbn ?? null,
               project: configSummary(targets.config),
               compile: compileSummary(compileStep),
+              backup: backupGate.summary,
               readyPattern: readyPattern ?? null,
               readyBaudRate,
               readyMatched,
@@ -2347,6 +2419,184 @@ server.registerTool(
           },
           !readyMatched
         );
+      } finally {
+        portCoordinator.release(port, lockOwner);
+      }
+    } catch (error) {
+      return toUnhandledError(error);
+    }
+  }
+);
+
+function firmwareResult(command: string, result: Awaited<ReturnType<typeof backupFirmware>>, extra?: { nextActions?: string[] }) {
+  return toToolResult(
+    {
+      ok: result.ok,
+      status: result.ok ? (result.verified === false ? "warning" : "ok") : "error",
+      command,
+      errorCode: result.errorCode,
+      reasonCodes: result.errorCode ? [result.errorCode] : undefined,
+      error: result.error,
+      note: result.notes.length > 0 ? result.notes.join(" ") : undefined,
+      data: {
+        imagePath: result.imagePath ?? null,
+        sidecarPath: result.sidecarPath ?? null,
+        verified: result.verified,
+        sidecar: result.sidecar ?? null,
+        steps: result.steps
+      },
+      nextActions: result.ok ? extra?.nextActions : undefined
+    },
+    !result.ok
+  );
+}
+
+server.registerTool(
+  "backup_firmware",
+  {
+    title: "Backup Firmware",
+    description:
+      "Read a board's whole flash to a file restore_firmware can write back, with a JSON sidecar (fqbn, port, USB VID/PID, chip/flash id, MAC for ESP, flash size, sha256, tool and version, date, label). AVR (arduino:avr): avrdude from the installed core, settings from the board's properties, Intel HEX. ESP8266/ESP32: esptool (core, else PATH, else python3 -m esptool), flash-id then the whole flash to .bin. Writes nothing to the board (ESP boards reset). Saves to backupDir, else BACKUP_DIR in tools/board.env, else <project>/backups/, with a .gitignore there: ESP images usually contain the Wi-Fi name and password. port and fqbn default to tools/board.env; check which board is on a port before using it.",
+    inputSchema: {
+      projectDir: projectDirSchema,
+      port: z.string().optional().describe("Serial port path. Default: PORT."),
+      fqbn: z
+        .string()
+        .optional()
+        .describe("Board FQBN, e.g. arduino:avr:nano:cpu=atmega328old or esp8266:esp8266:nodemcuv2. Default: FQBN."),
+      label: z.string().max(80).optional().describe("Short name for the backup, used in the file name and sidecar."),
+      backupDir: z.string().optional().describe("Absolute folder for the backup. Default: BACKUP_DIR, else <project>/backups."),
+      readBaud: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("ESP only: serial speed for reading the flash. Default 460800; use 115200 if the read fails.")
+    },
+    outputSchema: toolOutputShape,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    }
+  },
+  async ({ projectDir, port: portArg, fqbn: fqbnArg, label, backupDir: backupDirArg, readBaud }) => {
+    try {
+      const targets = resolveTargets({ projectDir, port: portArg, fqbn: fqbnArg }, ["port", "fqbn"]);
+      if (targets.missing.length > 0) {
+        return settingsMissingResult("backup_firmware", targets);
+      }
+      const port = targets.port!;
+      const backupDir = backupDirFor(backupDirArg, targets.config);
+      if (!backupDir) {
+        return toToolResult(
+          {
+            ok: false,
+            status: "error",
+            command: "backup_firmware",
+            errorCode: "BACKUP_DIR_UNKNOWN",
+            error: "No project (tools/board.env) and no backupDir given: pass backupDir."
+          },
+          true
+        );
+      }
+      const lockOwner = `backup_firmware:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
+      const lock = acquirePortLockOrError(port, lockOwner, "backup_firmware");
+      if (!lock.ok) {
+        return lock.toolResult;
+      }
+      try {
+        const result = await backupFirmware(firmwareDeps, { fqbn: targets.fqbn!, port, backupDir, label, readBaud });
+        return firmwareResult("backup_firmware", result);
+      } finally {
+        portCoordinator.release(port, lockOwner);
+      }
+    } catch (error) {
+      return toUnhandledError(error);
+    }
+  }
+);
+
+server.registerTool(
+  "restore_firmware",
+  {
+    title: "Restore Firmware",
+    description:
+      "Write a backup made by backup_firmware back to a board, then verify it (avrdude verify / esptool hash check). Same gates as upload_sketch: OUTPUTS must be known, mains needs confirmMains for every restore, safety preflight. Refuses when the backup's board family, MCU or flash size does not match the connected board, or the image no longer matches its sha256. port and fqbn default to tools/board.env.",
+    inputSchema: {
+      projectDir: projectDirSchema,
+      backup: z.string().describe("Path to the backup's .json sidecar (or its image file next to it)."),
+      port: z.string().optional().describe("Serial port path. Default: PORT."),
+      fqbn: z.string().optional().describe("FQBN of the connected board. Default: FQBN."),
+      outputs: outputsSchema,
+      confirmMains: confirmMainsSchema,
+      writeBaud: z.number().int().positive().optional().describe("ESP only: serial speed for writing. Default 460800."),
+      unsafeSkipPreflight: z
+        .boolean()
+        .optional()
+        .describe("If true, bypasses safety_preflight checks. Use only when user explicitly accepts risk."),
+      safetyContext: z
+        .object({
+          board: z.string().optional(),
+          fqbn: z.string().optional()
+        })
+        .optional()
+        .describe("Optional board name/FQBN for the safety preflight.")
+    },
+    outputSchema: toolOutputShape,
+    annotations: {
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false
+    }
+  },
+  async ({ projectDir, backup, port: portArg, fqbn: fqbnArg, outputs, confirmMains = false, writeBaud, unsafeSkipPreflight = false, safetyContext }) => {
+    try {
+      const targets = resolveTargets({ projectDir, port: portArg, fqbn: fqbnArg }, ["port", "fqbn"]);
+      if (targets.missing.length > 0) {
+        return settingsMissingResult("restore_firmware", targets);
+      }
+      const port = targets.port!;
+      const fqbn = targets.fqbn!;
+      const outputsGate = checkOutputsGate(outputs ?? targets.config?.outputs, confirmMains);
+      if (!outputsGate.ok) {
+        return gateFailedResult("restore_firmware", "outputs_check", outputsGate, { project: configSummary(targets.config) });
+      }
+      const resolvedBackup = resolveSketchPath(backup, arduinoConfig.sketchRoot);
+      const sidecarPath = resolvedBackup.endsWith(".json") ? resolvedBackup : resolvedBackup.replace(/\.[^./]+$/, ".json");
+
+      const lockOwner = `restore_firmware:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
+      const lock = acquirePortLockOrError(port, lockOwner, "restore_firmware");
+      if (!lock.ok) {
+        return lock.toolResult;
+      }
+      try {
+        const safetyGate = await runSafetyGate(
+          { board: safetyContext?.board, fqbn: safetyContext?.fqbn ?? fqbn },
+          port,
+          unsafeSkipPreflight
+        );
+        if (!safetyGate.ok) {
+          return toToolResult(
+            {
+              ok: false,
+              status: "error",
+              command: "restore_firmware",
+              stage: "preflight",
+              errorCode: safetyGate.errorCode,
+              reasonCodes: safetyGate.reasonCodes,
+              error: safetyGate.error
+            },
+            true
+          );
+        }
+        const result = await restoreFirmware(firmwareDeps, { sidecarPath, fqbn, port, writeBaud });
+        return firmwareResult("restore_firmware", result, {
+          nextActions: [
+            "Writing OK does not prove the program runs: open a serial session at its baud rate and check its output (boot marker)."
+          ]
+        });
       } finally {
         portCoordinator.release(port, lockOwner);
       }

@@ -136,6 +136,14 @@
       "description": "Record a serial session for a set duration (up to 10 minutes), optionally saving every line to a file."
     },
     {
+      "name": "backup_firmware",
+      "description": "Read a board's whole flash (AVR via avrdude, ESP8266/ESP32 via esptool) to a file plus a JSON sidecar."
+    },
+    {
+      "name": "restore_firmware",
+      "description": "Write a firmware backup back to a matching board, with the upload safety gates and verification."
+    },
+    {
       "name": "serial_write",
       "description": "Write bytes to a serial session with safety preflight enforcement."
     },
