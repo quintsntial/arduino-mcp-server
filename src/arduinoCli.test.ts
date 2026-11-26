@@ -18,3 +18,9 @@ test("ARDUINO_USER_DIR is passed on as ARDUINO_DIRECTORIES_USER, with ~ expanded
   assert.equal(env.ARDUINO_DIRECTORIES_USER, "/tmp/ard");
   assert.equal(env.PATH, "/bin");
 });
+
+test("TMPDIR is always set for child processes (ctags needs it)", () => {
+  assert.ok(childEnv({ PATH: "/bin" }).TMPDIR);
+  assert.ok(childEnv({ PATH: "/bin", TMPDIR: "" }).TMPDIR);
+  assert.equal(childEnv({ PATH: "/bin", TMPDIR: "/x/tmp" }).TMPDIR, "/x/tmp");
+});

@@ -51,10 +51,21 @@ export function arduinoUserDir(env: NodeJS.ProcessEnv = process.env): string | u
   return path.resolve(expanded);
 }
 
-/** Environment for child processes: passes ARDUINO_USER_DIR to arduino-cli as ARDUINO_DIRECTORIES_USER. */
+/**
+ * Environment for child processes: passes ARDUINO_USER_DIR to arduino-cli as ARDUINO_DIRECTORIES_USER,
+ * and makes sure TMPDIR is set. When the Claude app starts the server without TMPDIR, the ctags step of
+ * an Arduino build fails with "ctags: cannot open temporary file : No such file or directory".
+ */
 export function childEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ...env };
   const userDir = arduinoUserDir(env);
-  return userDir ? { ...env, ARDUINO_DIRECTORIES_USER: userDir } : { ...env };
+  if (userDir) {
+    out.ARDUINO_DIRECTORIES_USER = userDir;
+  }
+  if (!env.TMPDIR?.trim()) {
+    out.TMPDIR = os.tmpdir();
+  }
+  return out;
 }
 
 export async function runArduinoCli(
