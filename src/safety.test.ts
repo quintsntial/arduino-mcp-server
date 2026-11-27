@@ -1,7 +1,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { computeChargeCRate, runSafetyPreflight, type BatterySpec } from "./safety.js";
-import { getBoardReferenceById } from "./boardReference.js";
+import { findBoardReferenceByFqbn, getBoardReferenceById } from "./boardReference.js";
 
 function requireBoard(id: string) {
   const board = getBoardReferenceById(id);
@@ -187,5 +187,33 @@ describe("safety preflight - XIAO ESP32S3 UART/GPIO repurposing note", () => {
     });
     const finding = result.findings.find((f) => f.code === "UART_PIN_REUSED");
     assert.equal(finding, undefined);
+  });
+});
+
+describe("safety preflight - NodeMCU ESP8266 board reference", () => {
+  test("the FQBN esp8266:esp8266:nodemcuv2 resolves to the NodeMCU reference", () => {
+    assert.equal(findBoardReferenceByFqbn("esp8266:esp8266:nodemcuv2")?.id, "nodemcu_esp8266_v2");
+  });
+
+  test("display on D1/D2 (GPIO5/GPIO4) is not blocked and has no SPI flash finding", () => {
+    const board = requireBoard("nodemcu_esp8266_v2");
+    const result = runSafetyPreflight({
+      board,
+      wiring: [
+        { pin: "GPIO5", direction: "bidirectional", signalType: "i2c", voltage: 3.3 },
+        { pin: "GPIO4", direction: "bidirectional", signalType: "i2c", voltage: 3.3 }
+      ]
+    });
+    assert.equal(result.findings.find((f) => f.code === "SPI_FLASH_PIN_USED"), undefined);
+    assert.notEqual(result.status, "blocked");
+  });
+
+  test("wiring to GPIO9 (SPI flash) is a hard error", () => {
+    const board = requireBoard("nodemcu_esp8266_v2");
+    const result = runSafetyPreflight({
+      board,
+      wiring: [{ pin: "GPIO9", direction: "output", signalType: "digital" }]
+    });
+    assert.equal(result.status, "blocked");
   });
 });
