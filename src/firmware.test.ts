@@ -315,6 +315,8 @@ describe("backup, restore and the upload gate with fake tools", () => {
     assert.deepEqual(result.steps.map((s) => s.step), ["esptool flash id", "esptool read flash"]);
     const readArgs = result.steps[1].args;
     assert.deepEqual(readArgs.slice(-4, -1), ["read_flash", "0", String(1024 * 1024)]);
+    assert.deepEqual(readArgs.slice(-6, -4), ["--baud", "115200"], "ESP reads default to 115200");
+    assert.equal(result.sidecar?.readBaud, 115200);
   });
 
   test("ESP backup refuses when the chip is not what the FQBN says", async () => {

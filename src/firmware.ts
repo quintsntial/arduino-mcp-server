@@ -439,6 +439,12 @@ export function restoreProblems(sidecar: FirmwareSidecar, target: RestoreTarget)
   return problems;
 }
 
+/**
+ * Serial speed for reading ESP flash. 460800 failed with "Invalid head of packet (0x0D): Possible serial noise"
+ * on a CH340 NodeMCU (2026-11-27); 115200 read the whole 4 MB reliably (about 6 min).
+ */
+export const DEFAULT_ESP_READ_BAUD = 115_200;
+
 export const AVR_WEAK_MATCH_NOTE =
   "AVR boards have no unique ID readable through the bootloader, so the match uses FQBN + port + USB VID/PID: any board of the same type on the same port with the same USB chip counts as backed up.";
 
@@ -602,7 +608,7 @@ export async function backupFirmware(deps: FirmwareDeps, input: BackupInput): Pr
   if (!info.flashSizeBytes) {
     return fail("FLASH_SIZE_UNKNOWN", `esptool ${cmds.flashId} did not report the flash size, so the whole flash cannot be read.`, steps);
   }
-  const readBaud = input.readBaud ?? 460_800;
+  const readBaud = input.readBaud ?? DEFAULT_ESP_READ_BAUD;
   const imagePath = path.join(input.backupDir, `${base}.bin`);
   const readRaw = await logged(
     deps,
@@ -614,7 +620,7 @@ export async function backupFirmware(deps: FirmwareDeps, input: BackupInput): Pr
   );
   if (!readRaw.ok || !fs.existsSync(imagePath)) {
     fs.rmSync(imagePath, { force: true });
-    return fail("FLASH_READ_FAILED", `esptool ${cmds.readFlash} failed: ${tailOf(readRaw, 400)} (a lower readBaud such as 115200 may help).`, steps);
+    return fail("FLASH_READ_FAILED", `esptool ${cmds.readFlash} failed: ${tailOf(readRaw, 400)} (check the cable; a lower readBaud such as 57600 may help).`, steps);
   }
   const bytes = fs.statSync(imagePath).size;
   if (bytes !== info.flashSizeBytes) {

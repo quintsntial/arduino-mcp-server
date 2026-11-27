@@ -2471,7 +2471,7 @@ server.registerTool(
         .int()
         .positive()
         .optional()
-        .describe("ESP only: serial speed for reading the flash. Default 460800; use 115200 if the read fails.")
+        .describe("ESP only: serial speed for reading the flash. Default 115200 (4 MB takes about 6 minutes); faster speeds failed with serial noise on a CH340 board.")
     },
     outputSchema: toolOutputShape,
     annotations: {
