@@ -166,7 +166,8 @@ export function avrdudeArgs(plan: AvrdudePlan, port: string, op: "read" | "write
   const base = [`-C${plan.config}`, `-p${plan.mcu}`, `-c${plan.protocol}`, `-P${port}`];
   if (plan.speed) base.push(`-b${plan.speed}`);
   // Writing: -D as in the core's upload pattern (the bootloader erases page by page); verify stays on.
-  return op === "read" ? [...base, `-Uflash:r:${file}:i`] : [...base, "-D", `-Uflash:w:${file}:i`];
+  // Reading: -v so avrdude 8 prints the device signature (the chip id recorded in the sidecar).
+  return op === "read" ? [...base, "-v", `-Uflash:r:${file}:i`] : [...base, "-D", `-Uflash:w:${file}:i`];
 }
 
 /** Flash size of common AVR MCUs (for restore checks); null when unknown. */

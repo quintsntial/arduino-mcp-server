@@ -86,6 +86,7 @@ describe("pure helpers", () => {
       "-carduino",
       "-P/dev/cu.usbserial-230",
       "-b57600",
+      "-v",
       "-Uflash:r:/b/x.hex:i"
     ]);
     const write = avrdudeArgs(plan, "/dev/p", "write", "/b/x.hex");
