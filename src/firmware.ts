@@ -444,6 +444,8 @@ export function restoreProblems(sidecar: FirmwareSidecar, target: RestoreTarget)
  * on a CH340 NodeMCU (2026-11-27); 115200 read the whole 4 MB reliably (about 6 min).
  */
 export const DEFAULT_ESP_READ_BAUD = 115_200;
+/** Serial speed for writing ESP flash in restore_firmware: same reasoning as reading. */
+export const DEFAULT_ESP_WRITE_BAUD = 115_200;
 
 export const AVR_WEAK_MATCH_NOTE =
   "AVR boards have no unique ID readable through the bootloader, so the match uses FQBN + port + USB VID/PID: any board of the same type on the same port with the same USB chip counts as backed up.";
@@ -725,7 +727,7 @@ export async function restoreFirmware(deps: FirmwareDeps, input: RestoreInput): 
       steps,
       "esptool write flash",
       esptool.command,
-      [...esptool.prefixArgs, "--port", input.port, "--baud", String(input.writeBaud ?? 460_800), cmds.writeFlash, "0", imagePath],
+      [...esptool.prefixArgs, "--port", input.port, "--baud", String(input.writeBaud ?? DEFAULT_ESP_WRITE_BAUD), cmds.writeFlash, "0", imagePath],
       20 * 60_000
     );
     if (!raw.ok) {

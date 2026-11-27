@@ -2531,7 +2531,12 @@ server.registerTool(
       fqbn: z.string().optional().describe("FQBN of the connected board. Default: FQBN."),
       outputs: outputsSchema,
       confirmMains: confirmMainsSchema,
-      writeBaud: z.number().int().positive().optional().describe("ESP only: serial speed for writing. Default 460800."),
+      writeBaud: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("ESP only: serial speed for writing. Default 115200 (4 MB takes several minutes); faster speeds failed with serial noise on a CH340 board."),
       unsafeSkipPreflight: z
         .boolean()
         .optional()

@@ -236,6 +236,10 @@ describe("backup, restore and the upload gate with fake tools", () => {
         return ok("Chip is ESP8266EX\nMAC: 5c:cf:7f:aa:bb:cc\nManufacturer: 20\nDevice: 4016\nDetected flash size: 1MB\n");
       }
       if (command === "python3" && args.includes("read_mac")) return ok("Chip is ESP8266EX\nMAC: 5c:cf:7f:aa:bb:cc\n");
+      if (command === "python3" && args.includes("write_flash")) {
+        writes.push(args);
+        return ok("Wrote 1048576 bytes at 0x00000000 in 90.0 seconds\nHash of data verified.\nHard resetting via RTS pin...");
+      }
       if (command === "python3" && args.includes("read_flash")) {
         fs.writeFileSync(args[args.length - 1], Buffer.alloc(Number(args[args.length - 2]), 0xab));
         return ok("Read 1048576 bytes at 0x00000000");
@@ -322,6 +326,20 @@ describe("backup, restore and the upload gate with fake tools", () => {
   test("ESP backup refuses when the chip is not what the FQBN says", async () => {
     const result = await backupFirmware(deps(), { fqbn: "esp32:esp32:esp32", port, backupDir: path.join(dir, "esp32") });
     assert.equal(result.errorCode, "CHIP_MISMATCH");
+  });
+
+  test("ESP restore: flash id check, write at 115200 by default, hash verified", async () => {
+    const espDir = path.join(dir, "esp");
+    const sidecarPath = fs.readdirSync(espDir).filter((f) => f.endsWith(".json")).map((f) => path.join(espDir, f))[0];
+    writes = [];
+    const result = await restoreFirmware(deps(), { sidecarPath, fqbn: "esp8266:esp8266:nodemcuv2", port });
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.verified, true);
+    assert.deepEqual(result.steps.map((s) => s.step), ["esptool flash id", "esptool write flash"]);
+    assert.equal(writes.length, 1);
+    const args = writes[0];
+    assert.deepEqual(args.slice(args.indexOf("--baud"), args.indexOf("--baud") + 2), ["--baud", "115200"]);
+    assert.deepEqual(args.slice(-3, -1), ["write_flash", "0"]);
   });
 
   test("upload gate: AVR backup found (weak match noted), missing backup refused with the weakness explained", async () => {
