@@ -89,7 +89,7 @@
     },
     {
       "name": "ensure_core_installed",
-      "description": "Ensure the required Arduino core is installed, with optional automatic installation."
+      "description": "Ensure the required Arduino core is installed, with optional automatic installation. Optional projectDir and boardUrls: package index URLs (default BOARD_URLS from tools/board.env) are passed as --additional-urls; the result lists the URLs used."
     },
     {
       "name": "install_libraries",
@@ -105,7 +105,7 @@
     },
     {
       "name": "upload_and_wait_ready",
-      "description": "Compile, upload a sketch and wait for a serial readiness pattern after reboot."
+      "description": "Compile, upload a sketch and wait for a serial readiness pattern after reboot. On ESP8266 the port is opened first and the board reset through DTR/RTS (resetAfterUpload, needs python3 with pyserial), so a boot marker printed once in setup() is seen; a miss is reported as READY_BOOTED_BEFORE_MONITOR, not as an upload failure."
     },
     {
       "name": "read_serial_snapshot",

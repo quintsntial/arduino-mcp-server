@@ -76,10 +76,10 @@ Requires [arduino-cli](https://arduino.github.io/arduino-cli/) on your PATH, or 
 | `detect_hardware` | Detect connected boards and infer FQBNs |
 | `list_connected_boards` | List all connected Arduino boards |
 | `list_serial_ports` | List available serial ports |
-| `ensure_core_installed` | Check/install board cores |
+| `ensure_core_installed` | Check/install board cores; `projectDir`/`boardUrls` pass package index URLs (default `BOARD_URLS` from `tools/board.env`) as `--additional-urls` |
 | `compile_sketch` | Compile a sketch for a target board |
 | `upload_sketch` | Compile the current source and upload it to a board |
-| `upload_and_wait_ready` | Compile, upload and wait for device ready signal |
+| `upload_and_wait_ready` | Compile, upload and wait for device ready signal (`resetAfterUpload`: see below) |
 | `backup_firmware` | Read a board's whole flash (AVR: avrdude, Intel HEX; ESP8266/ESP32: esptool, .bin) plus a JSON sidecar |
 | `restore_firmware` | Write a backup back (same gates as upload; refuses another board family, MCU or flash size; verifies) |
 | `serial_open_session` | Open a stateful serial session |
@@ -95,6 +95,22 @@ Requires [arduino-cli](https://arduino.github.io/arduino-cli/) on your PATH, or 
 | `list_supported_boards` | List all boards arduino-cli supports |
 | `list_board_reference` | Browse board pin reference |
 | `search_board_reference` | Search board reference by keyword |
+
+### Third-party cores and boot markers
+
+`ensure_core_installed` (and the automatic core install in `compile_sketch`, `upload_sketch` and `upload_and_wait_ready`)
+passes the package index URLs as `--additional-urls` to `core update-index`, `core list` and `core install`. The URLs come
+from the `boardUrls` argument, else from `BOARD_URLS` in the project's `tools/board.env`; the result shows which ones were
+used (`boardUrls`, `boardUrlsSource`).
+
+ESP8266 boards reboot right after an upload and boot before `arduino-cli monitor` is open, so a marker printed once in
+`setup()` would be missed. `upload_and_wait_ready` therefore (`resetAfterUpload`, default `auto`) opens the serial port
+first and then resets the board through DTR/RTS (the esptool sequence), and reads that boot. This needs `python3` with
+`pyserial` (installed with esptool; set `ARDUINO_PYTHON_PATH` for another interpreter). AVR boards such as the Nano reset
+when the port opens and keep the plain monitor. `dtr-rts` forces the reset, `none` forces the plain monitor. If the
+marker is not seen, `errorCode` says why: `READY_BOOTED_BEFORE_MONITOR` (ESP board, no reset available),
+`READY_RESET_FAILED` (reset pulse failed) or `READY_PATTERN_TIMEOUT`; none of these is an upload failure
+(`UPLOAD_FAILED`).
 
 ### Firmware backups
 

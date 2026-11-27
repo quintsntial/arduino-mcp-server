@@ -36,6 +36,8 @@ import {
   type ProjectConfig,
   type ResolvedTargets
 } from "./projectConfig.js";
+import { coreCommandArgs, resolveBoardUrls } from "./coreInstall.js";
+import { captureWithReset, classifyReadyFailure, shouldResetAfterUpload, type ResetMode } from "./resetCapture.js";
 import {
   findBootMarker,
   parseDiagnostics,
@@ -441,6 +443,7 @@ interface EnsureCoreResult {
   alreadyInstalled: boolean;
   autoInstallRequested: boolean;
   autoInstallAttempted: boolean;
+  boardUrls: string[];
   listBeforeRaw?: CommandResult;
   updateIndexRaw?: CommandResult;
   installRaw?: CommandResult;
@@ -448,8 +451,9 @@ interface EnsureCoreResult {
   error?: string;
 }
 
-async function ensureCoreInstalled(coreId: string, autoInstall = true): Promise<EnsureCoreResult> {
-  const listBeforeRaw = await runArduinoCli(arduinoConfig, ["core", "list", "--format", "json"], 120_000);
+async function ensureCoreInstalled(coreId: string, autoInstall = true, boardUrls: string[] = []): Promise<EnsureCoreResult> {
+  const cmd = coreCommandArgs(coreId, boardUrls);
+  const listBeforeRaw = await runArduinoCli(arduinoConfig, cmd.list, 120_000);
   if (!listBeforeRaw.ok) {
     return {
       ok: false,
@@ -458,6 +462,7 @@ async function ensureCoreInstalled(coreId: string, autoInstall = true): Promise<
       alreadyInstalled: false,
       autoInstallRequested: autoInstall,
       autoInstallAttempted: false,
+      boardUrls,
       listBeforeRaw,
       error: "Failed to list installed Arduino cores."
     };
@@ -473,6 +478,7 @@ async function ensureCoreInstalled(coreId: string, autoInstall = true): Promise<
       alreadyInstalled: true,
       autoInstallRequested: autoInstall,
       autoInstallAttempted: false,
+      boardUrls,
       listBeforeRaw
     };
   }
@@ -485,14 +491,15 @@ async function ensureCoreInstalled(coreId: string, autoInstall = true): Promise<
       alreadyInstalled: false,
       autoInstallRequested: false,
       autoInstallAttempted: false,
+      boardUrls,
       listBeforeRaw,
       error: `Required core "${coreId}" is not installed.`
     };
   }
 
-  const updateIndexRaw = await runArduinoCli(arduinoConfig, ["core", "update-index"], 240_000);
-  const installRaw = await runArduinoCli(arduinoConfig, ["core", "install", coreId], 600_000);
-  const listAfterRaw = await runArduinoCli(arduinoConfig, ["core", "list", "--format", "json"], 120_000);
+  const updateIndexRaw = await runArduinoCli(arduinoConfig, cmd.updateIndex, 240_000);
+  const installRaw = await runArduinoCli(arduinoConfig, cmd.install, 600_000);
+  const listAfterRaw = await runArduinoCli(arduinoConfig, cmd.list, 120_000);
 
   const afterParsed = tryParseJson<unknown>(listAfterRaw.stdout);
   const installedAfter = listAfterRaw.ok && extractInstalledCoreIds(afterParsed).has(coreId);
@@ -505,6 +512,7 @@ async function ensureCoreInstalled(coreId: string, autoInstall = true): Promise<
     alreadyInstalled: false,
     autoInstallRequested: true,
     autoInstallAttempted: true,
+    boardUrls,
     listBeforeRaw,
     updateIndexRaw,
     installRaw,
@@ -1366,10 +1374,15 @@ server.registerTool(
   {
     title: "Ensure Core Installed",
     description:
-      "Ensure the Arduino core required by a board FQBN is installed. Can auto-install via `arduino-cli core install`.",
+      "Ensure the Arduino core required by a board FQBN is installed. Can auto-install via `arduino-cli core install`. Third-party cores (e.g. esp8266) need a package index URL: it is taken from boardUrls, else from BOARD_URLS in the project's tools/board.env, and passed as --additional-urls. fqbn/coreId default to FQBN/CORE from board.env.",
     inputSchema: {
-      fqbn: z.string().optional().describe("Board FQBN, e.g. arduino:avr:uno."),
-      coreId: z.string().optional().describe("Core ID, e.g. arduino:avr."),
+      projectDir: projectDirSchema,
+      fqbn: z.string().optional().describe("Board FQBN, e.g. arduino:avr:uno. Default: FQBN from tools/board.env."),
+      coreId: z.string().optional().describe("Core ID, e.g. arduino:avr. Default: CORE from tools/board.env, else derived from the FQBN."),
+      boardUrls: z
+        .array(z.string())
+        .optional()
+        .describe("Board package index URLs (--additional-urls). Default: BOARD_URLS from tools/board.env."),
       autoInstall: z.boolean().optional().describe("If true (default), install missing core automatically.")
     },
     outputSchema: toolOutputShape,
@@ -1379,9 +1392,13 @@ server.registerTool(
       openWorldHint: false
     }
   },
-  async ({ fqbn, coreId, autoInstall = true }) => {
+  async ({ projectDir, fqbn: fqbnArg, coreId: coreIdArg, boardUrls: boardUrlsArg, autoInstall = true }) => {
     try {
+      const config = loadProjectConfig({ projectDir });
+      const fqbn = fqbnArg ?? (coreIdArg ? undefined : config?.fqbn);
+      const coreId = coreIdArg ?? (fqbnArg ? undefined : config?.core);
       const resolvedCoreId = coreId ?? (fqbn ? fqbnToCoreId(fqbn) : null);
+      const urlChoice = resolveBoardUrls(boardUrlsArg, config?.boardUrls);
       if (!resolvedCoreId) {
         return toToolResult(
           {
@@ -1391,13 +1408,13 @@ server.registerTool(
               fqbn: fqbn ?? null,
               coreId: coreId ?? null
             },
-            error: "Provide either a valid `coreId` or `fqbn`."
+            error: "Provide either a valid `coreId` or `fqbn` (or a projectDir whose tools/board.env has CORE or FQBN)."
           },
           true
         );
       }
 
-      const ensure = await ensureCoreInstalled(resolvedCoreId, autoInstall);
+      const ensure = await ensureCoreInstalled(resolvedCoreId, autoInstall, urlChoice.urls);
       const primaryRaw = ensure.installRaw ?? ensure.listBeforeRaw;
       const primaryErrorRaw = ensure.installRaw ?? ensure.listBeforeRaw ?? ensure.listAfterRaw;
 
@@ -1412,6 +1429,8 @@ server.registerTool(
             alreadyInstalled: ensure.alreadyInstalled,
             autoInstallRequested: ensure.autoInstallRequested,
             autoInstallAttempted: ensure.autoInstallAttempted,
+            boardUrls: ensure.boardUrls,
+            boardUrlsSource: urlChoice.source,
             commands: {
               listBefore: ensure.listBeforeRaw ? summarizeCommandResult(ensure.listBeforeRaw) : null,
               updateIndex: ensure.updateIndexRaw ? summarizeCommandResult(ensure.updateIndexRaw) : null,
@@ -1797,7 +1816,9 @@ server.registerTool(
       const fqbn = targets.fqbn!;
       const resolvedSketchPath = resolveSketchPath(sketchPath, arduinoConfig.sketchRoot);
       const coreId = fqbnToCoreId(fqbn);
-      const coreEnsure = coreId ? await ensureCoreInstalled(coreId, autoInstallCore) : null;
+      const coreEnsure = coreId
+        ? await ensureCoreInstalled(coreId, autoInstallCore, resolveBoardUrls(undefined, targets.config?.boardUrls).urls)
+        : null;
       if (coreEnsure && !coreEnsure.ok) {
         const rawForError = coreEnsure.installRaw ?? coreEnsure.listBeforeRaw ?? coreEnsure.listAfterRaw;
         return toToolResult(
@@ -1812,7 +1833,8 @@ server.registerTool(
               coreEnsure: {
                 installed: coreEnsure.installed,
                 alreadyInstalled: coreEnsure.alreadyInstalled,
-                autoInstallAttempted: coreEnsure.autoInstallAttempted
+                autoInstallAttempted: coreEnsure.autoInstallAttempted,
+                boardUrls: coreEnsure.boardUrls
               }
             },
             raw: rawForError,
@@ -2026,7 +2048,9 @@ server.registerTool(
 
         const resolvedSketchPath = resolveSketchPath(sketchPath, arduinoConfig.sketchRoot);
         const coreId = fqbn ? fqbnToCoreId(fqbn) : null;
-        const coreEnsure = coreId ? await ensureCoreInstalled(coreId, autoInstallCore) : null;
+        const coreEnsure = coreId
+        ? await ensureCoreInstalled(coreId, autoInstallCore, resolveBoardUrls(undefined, targets.config?.boardUrls).urls)
+        : null;
         if (coreEnsure && !coreEnsure.ok) {
           const rawForError = coreEnsure.installRaw ?? coreEnsure.listBeforeRaw ?? coreEnsure.listAfterRaw;
           return toToolResult(
@@ -2045,7 +2069,8 @@ server.registerTool(
                 coreEnsure: {
                   installed: coreEnsure.installed,
                   alreadyInstalled: coreEnsure.alreadyInstalled,
-                  autoInstallAttempted: coreEnsure.autoInstallAttempted
+                  autoInstallAttempted: coreEnsure.autoInstallAttempted,
+                  boardUrls: coreEnsure.boardUrls
                 }
               },
               raw: rawForError,
@@ -2177,6 +2202,12 @@ server.registerTool(
         .optional()
         .describe("Baud rate for readiness check. Default: BAUD from tools/board.env, else 115200."),
       readyCaseSensitive: z.boolean().optional().describe("If true, readiness matching is case-sensitive."),
+      resetAfterUpload: z
+        .enum(["auto", "dtr-rts", "none"])
+        .optional()
+        .describe(
+          "How to see a boot marker printed once in setup(). auto (default): ESP8266 boards, which boot before a monitor can open, are captured with the port opened first and the board then reset through DTR/RTS (needs python3 with pyserial, as installed with esptool); other boards (AVR resets when the port opens) use the plain monitor. dtr-rts forces the reset, none forces the plain monitor."
+        ),
       unsafeSkipPreflight: z
         .boolean()
         .optional()
@@ -2238,6 +2269,7 @@ server.registerTool(
     readyTimeoutMs = 20_000,
     readyBaudRate: readyBaudRateArg,
     readyCaseSensitive = false,
+    resetAfterUpload = "auto",
     unsafeSkipPreflight = false,
     safetyContext
   }) => {
@@ -2300,7 +2332,9 @@ server.registerTool(
 
         const resolvedSketchPath = resolveSketchPath(sketchPath, arduinoConfig.sketchRoot);
         const coreId = fqbn ? fqbnToCoreId(fqbn) : null;
-        const coreEnsure = coreId ? await ensureCoreInstalled(coreId, autoInstallCore) : null;
+        const coreEnsure = coreId
+        ? await ensureCoreInstalled(coreId, autoInstallCore, resolveBoardUrls(undefined, targets.config?.boardUrls).urls)
+        : null;
         if (coreEnsure && !coreEnsure.ok) {
           const rawForError = coreEnsure.installRaw ?? coreEnsure.listBeforeRaw ?? coreEnsure.listAfterRaw;
           return toToolResult(
@@ -2363,14 +2397,46 @@ server.registerTool(
 
         let readyMatched = true;
         let capture: MonitorCapture | null = null;
+        let resetRequested = false;
+        let resetDone = false;
+        let resetNote: string | null = null;
+        let captureMethod: string | null = null;
         if (readyPattern && readyPattern.trim().length > 0) {
-          capture = await captureMonitor(arduinoConfig.cliPath, port, readyBaudRate, {
-            timeoutMs: Math.min(Math.max(readyTimeoutMs, 500), 120_000),
-            pattern: readyPattern,
-            caseSensitive: readyCaseSensitive
-          });
+          const captureTimeoutMs = Math.min(Math.max(readyTimeoutMs, 500), 120_000);
+          const mode: ResetMode = resetAfterUpload;
+          if (shouldResetAfterUpload(mode, fqbn)) {
+            resetRequested = true;
+            const outcome = await captureWithReset(process.env.ARDUINO_PYTHON_PATH?.trim() || "python3", port, readyBaudRate, {
+              timeoutMs: captureTimeoutMs,
+              pattern: readyPattern,
+              caseSensitive: readyCaseSensitive,
+              reset: true
+            });
+            if (outcome.kind === "ok") {
+              capture = outcome.capture;
+              resetDone = outcome.resetDone;
+              resetNote = outcome.resetError;
+              captureMethod = "port opened first, then DTR/RTS reset (pyserial)";
+            } else {
+              resetNote = outcome.reason;
+              captureMethod = `plain monitor after upload (DTR/RTS helper unavailable: ${outcome.reason})`;
+              resetRequested = false;
+            }
+          } else {
+            captureMethod = "plain monitor after upload";
+          }
+          if (!capture) {
+            capture = await captureMonitor(arduinoConfig.cliPath, port, readyBaudRate, {
+              timeoutMs: captureTimeoutMs,
+              pattern: readyPattern,
+              caseSensitive: readyCaseSensitive
+            });
+          }
           readyMatched = capture.matched;
         }
+        const readyFailure = readyPattern
+          ? classifyReadyFailure({ matched: readyMatched, resetRequested, resetDone, fqbn })
+          : null;
         const uploadMemory = compileStep?.memory ?? parseMemoryUse(uploadRaw.stdout);
         const reasonCodes = [
           ...(safetyGate.skipped ? ["SAFETY_PREFLIGHT_SKIPPED"] : safetyGate.safety?.reasonCodes ?? []),
@@ -2383,7 +2449,7 @@ server.registerTool(
             status: readyMatched ? (compile ? "ok" : "warning") : "error",
             command: "upload_and_wait_ready",
             stage: readyPattern ? "wait_ready" : "upload",
-            errorCode: readyMatched ? undefined : "READY_PATTERN_TIMEOUT",
+            errorCode: readyFailure?.errorCode,
             reasonCodes: reasonCodes.length > 0 ? reasonCodes : undefined,
             data: {
               sketchPath: resolvedSketchPath,
@@ -2395,6 +2461,9 @@ server.registerTool(
               readyPattern: readyPattern ?? null,
               readyBaudRate,
               readyMatched,
+              captureMethod,
+              resetDone: resetRequested ? resetDone : null,
+              resetNote,
               waitedMs: capture?.durationMs ?? null,
               monitorStarts: capture?.attempts ?? null,
               bootMarker: capture ? findBootMarker(capture.text) : null,
@@ -2409,13 +2478,18 @@ server.registerTool(
                 : ["compile=false uploaded the last build, which may be older than the source."]
               : [
                   "Check that the sketch prints the pattern at this baud rate (Serial.begin), and that no other program holds the port.",
-                  "An old boot marker in serialLines means the old code is still running."
+                  "An old boot marker in serialLines means the old code is still running.",
+                  ...(readyFailure?.errorCode === "READY_BOOTED_BEFORE_MONITOR"
+                    ? ["Retry with resetAfterUpload=\"dtr-rts\" (needs python3 with pyserial)."]
+                    : [])
                 ],
             error: readyMatched
               ? undefined
-              : capture && capture.text.length === 0
-                ? "Upload succeeded but no serial output arrived before the timeout."
-                : "Upload succeeded but readiness pattern was not observed before timeout."
+              : readyFailure && readyFailure.errorCode !== "READY_PATTERN_TIMEOUT"
+                ? readyFailure.message
+                : capture && capture.text.length === 0
+                  ? "Upload succeeded but no serial output arrived before the timeout."
+                  : "Upload succeeded but readiness pattern was not observed before timeout."
           },
           !readyMatched
         );
