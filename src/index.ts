@@ -24,7 +24,17 @@ import {
 } from "./arduinoCli.js";
 import { PortOperationCoordinator } from "./portCoordinator.js";
 import { MAX_RECORD_MS, SerialSessionManager } from "./serialSessions.js";
-import { backupFirmware, checkBackupGate, restoreFirmware, type FirmwareDeps } from "./firmware.js";
+import {
+  backupFirmware,
+  checkBackupGate,
+  findBuiltImage,
+  restoreFirmware,
+  setUploadRecordBootMarker,
+  writeUploadRecord,
+  type BoardIdentity,
+  type FirmwareDeps,
+  type UploadImage
+} from "./firmware.js";
 import { runSafetyPreflight, type BatterySpec, type PowerSpec, type WiringSignal } from "./safety.js";
 import {
   OUTPUT_KINDS,
@@ -839,47 +849,93 @@ const backupOverrideSchema = z
   .boolean()
   .optional()
   .describe(
-    "Only when BACKUP_BEFORE_UPLOAD=1 in board.env and no backup exists: true uploads anyway. Pass it only after the user explicitly approved uploading without a backup."
+    "Only when BACKUP_BEFORE_UPLOAD=1 in board.env: true skips the check that the flash content is saved and uploads anyway. Pass it only after the user explicitly approved uploading without a backup."
   );
 
+/** What the upload tools need to write the upload record after a successful upload. */
+interface UploadRecordTarget {
+  backupDir: string;
+  board: BoardIdentity;
+  image: UploadImage;
+  sketchPath: string;
+}
+
 /**
- * BACKUP_BEFORE_UPLOAD gate of the upload tools. Returns a refusal to send back, or a summary for the
- * result (null when the project does not require backups).
+ * BACKUP_BEFORE_UPLOAD gate of the upload tools. Needs the compiled image (compile first). Returns a refusal
+ * to send back, or a summary for the result (null when the project does not require backups). The gate
+ * compares the part of the flash that the upload overwrites with the last upload and the newest backup,
+ * and makes a new backup when neither matches (see checkBackupGate).
  */
 async function backupGateForUpload(
   command: string,
   config: ProjectConfig | null,
   fqbn: string | undefined,
   port: string,
-  overrideApproved: boolean
-): Promise<{ refusal: ReturnType<typeof toToolResult> } | { summary: unknown }> {
+  overrideApproved: boolean,
+  sketchPath: string
+): Promise<{ refusal: ReturnType<typeof toToolResult> } | { summary: unknown; record?: UploadRecordTarget }> {
   if (!config?.backupBeforeUpload) {
     return { summary: null };
   }
   if (overrideApproved) {
     return { summary: { required: true, overriddenByUser: true } };
   }
-  const gate = await checkBackupGate(firmwareDeps, { fqbn, port, backupDir: backupDirFor(undefined, config)! });
-  if (!gate.ok) {
-    return {
-      refusal: toToolResult(
-        {
-          ok: false,
-          status: "error",
-          command,
-          stage: "backup_check",
-          errorCode: gate.errorCode,
-          error: gate.error,
-          nextActions: [
-            "Run backup_firmware for this board first, then retry the upload.",
-            "Pass backupOverrideApproved=true only if the user explicitly approves uploading without a backup."
-          ]
-        },
-        true
-      )
-    };
+  const backupDir = backupDirFor(undefined, config)!;
+  const refuse = (errorCode: string | undefined, error: string | undefined, steps?: unknown) => ({
+    refusal: toToolResult(
+      {
+        ok: false,
+        status: "error" as const,
+        command,
+        stage: "backup_check",
+        errorCode,
+        error,
+        data: steps ? { steps } : undefined,
+        nextActions: [
+          "Check the cable and the port, then retry: the upload checks that the flash of the board is saved before it overwrites it.",
+          "Run backup_firmware for this board, then retry the upload.",
+          "Pass backupOverrideApproved=true only if the user explicitly approves uploading without a backup."
+        ]
+      },
+      true
+    )
+  });
+  if (!fqbn) {
+    return refuse("BACKUP_REQUIRED", "BACKUP_BEFORE_UPLOAD is set, but without an FQBN no backup can be checked. Nothing was uploaded.");
   }
-  return { summary: { required: true, matched: gate.matched, note: gate.note } };
+  const built = await findBuiltImage(firmwareDeps, sketchPath, fqbn);
+  if ("error" in built) {
+    return refuse("FLASH_CHECK_FAILED", `BACKUP_BEFORE_UPLOAD is set, but the image to upload was not found: ${built.error} Nothing was uploaded.`);
+  }
+  const gate = await checkBackupGate(firmwareDeps, { fqbn, port, backupDir, image: built.image });
+  if (!gate.ok) {
+    return refuse(gate.errorCode, gate.error, gate.steps);
+  }
+  return {
+    summary: {
+      required: true,
+      comparison: gate.comparison,
+      matched: gate.matched,
+      lastUpload: gate.lastUpload,
+      newBackup: gate.newBackup,
+      region: gate.region,
+      note: gate.note
+    },
+    record: gate.board ? { backupDir, board: gate.board, image: built.image, sketchPath } : undefined
+  };
+}
+
+/** After a successful upload: keep the image and a record of it, so the next upload can tell what is on the board. */
+function recordUpload(target: UploadRecordTarget | undefined): { recordPath?: string; error?: string } | null {
+  if (!target) {
+    return null;
+  }
+  try {
+    const written = writeUploadRecord({}, { backupDir: target.backupDir, board: target.board, image: target.image, sketchPath: target.sketchPath });
+    return { recordPath: written.recordPath };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 function configSummary(config: ProjectConfig | null) {
@@ -2086,11 +2142,6 @@ server.registerTool(
           );
         }
 
-        const backupGate = await backupGateForUpload("upload", targets.config, fqbn, port, backupOverrideApproved);
-        if ("refusal" in backupGate) {
-          return backupGate.refusal;
-        }
-
         let compileStep: CompileStep | null = null;
         if (compile) {
           const compiled = await compileBeforeUpload("upload", resolvedSketchPath, fqbn);
@@ -2098,6 +2149,12 @@ server.registerTool(
             return compiled.refusal;
           }
           compileStep = compiled.step;
+        }
+
+        // After the compile: the backup check compares the flash with the image that is about to be written.
+        const backupGate = await backupGateForUpload("upload", targets.config, fqbn, port, backupOverrideApproved, resolvedSketchPath);
+        if ("refusal" in backupGate) {
+          return backupGate.refusal;
         }
 
         const args = ["upload", resolvedSketchPath, "-p", port];
@@ -2109,6 +2166,7 @@ server.registerTool(
         }
 
         const raw = await runArduinoCli(arduinoConfig, args, 300_000);
+        const uploadRecord = raw.ok && "record" in backupGate ? recordUpload(backupGate.record) : null;
         const reasonCodes = [
           ...(safetyGate.skipped ? ["SAFETY_PREFLIGHT_SKIPPED"] : safetyGate.safety?.reasonCodes ?? []),
           ...(compile ? [] : ["UPLOAD_WITHOUT_COMPILE"])
@@ -2135,6 +2193,7 @@ server.registerTool(
               outputs: outputs ?? targets.config?.outputs ?? null,
               compile: compileSummary(compileStep),
               backup: backupGate.summary,
+              uploadRecord,
               coreId,
               safety: safetySummary(safetyGate),
               coreEnsure: coreEnsure
@@ -2357,11 +2416,6 @@ server.registerTool(
           );
         }
 
-        const backupGate = await backupGateForUpload("upload_and_wait_ready", targets.config, fqbn, port, backupOverrideApproved);
-        if ("refusal" in backupGate) {
-          return backupGate.refusal;
-        }
-
         let compileStep: CompileStep | null = null;
         if (compile) {
           const compiled = await compileBeforeUpload("upload_and_wait_ready", resolvedSketchPath, fqbn);
@@ -2369,6 +2423,12 @@ server.registerTool(
             return compiled.refusal;
           }
           compileStep = compiled.step;
+        }
+
+        // After the compile: the backup check compares the flash with the image that is about to be written.
+        const backupGate = await backupGateForUpload("upload_and_wait_ready", targets.config, fqbn, port, backupOverrideApproved, resolvedSketchPath);
+        if ("refusal" in backupGate) {
+          return backupGate.refusal;
         }
 
         const uploadArgs = ["upload", resolvedSketchPath, "-p", port];
@@ -2395,6 +2455,7 @@ server.registerTool(
           );
         }
 
+        const uploadRecord = "record" in backupGate ? recordUpload(backupGate.record) : null;
         let readyMatched = true;
         let capture: MonitorCapture | null = null;
         let resetRequested = false;
@@ -2434,6 +2495,10 @@ server.registerTool(
           }
           readyMatched = capture.matched;
         }
+        const seenBootMarker = capture ? findBootMarker(capture.text) : null;
+        if (uploadRecord?.recordPath && seenBootMarker) {
+          setUploadRecordBootMarker(uploadRecord.recordPath, seenBootMarker);
+        }
         const readyFailure = readyPattern
           ? classifyReadyFailure({ matched: readyMatched, resetRequested, resetDone, fqbn })
           : null;
@@ -2458,6 +2523,7 @@ server.registerTool(
               project: configSummary(targets.config),
               compile: compileSummary(compileStep),
               backup: backupGate.summary,
+              uploadRecord,
               readyPattern: readyPattern ?? null,
               readyBaudRate,
               readyMatched,
@@ -2466,7 +2532,7 @@ server.registerTool(
               resetNote,
               waitedMs: capture?.durationMs ?? null,
               monitorStarts: capture?.attempts ?? null,
-              bootMarker: capture ? findBootMarker(capture.text) : null,
+              bootMarker: seenBootMarker,
               serialLines: capture ? serialLines(capture.text).slice(-40) : [],
               memory: uploadMemory ?? undefined,
               safety: safetySummary(safetyGate)

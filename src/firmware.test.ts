@@ -1,5 +1,6 @@
-import { after, before, describe, test } from "node:test";
+import { after, afterEach, before, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -13,8 +14,10 @@ import {
   checkBackupGate,
   chipFamily,
   esptoolCandidates,
+  espRegionBytes,
   esptoolCommands,
   familyFromFqbn,
+  findLastUpload,
   intelHexStats,
   parseAvrSignature,
   parseEsptoolVersion,
@@ -23,8 +26,11 @@ import {
   restoreFirmware,
   restoreProblems,
   sidecarMatchesBoard,
+  writeUploadRecord,
+  type BoardIdentity,
   type FirmwareDeps,
-  type FirmwareSidecar
+  type FirmwareSidecar,
+  type UploadImage
 } from "./firmware.js";
 
 // Excerpt of `arduino-cli board details -b arduino:avr:nano:cpu=atmega328old --show-properties=expanded`.
@@ -124,8 +130,8 @@ describe("pure helpers", () => {
   test("esptool version decides the command names", () => {
     assert.equal(parseEsptoolVersion("esptool.py v4.7.0\n4.7.0")?.major, 4);
     assert.equal(parseEsptoolVersion("esptool v5.0.2")?.text, "5.0.2");
-    assert.deepEqual(esptoolCommands(4), { flashId: "flash_id", readFlash: "read_flash", writeFlash: "write_flash", readMac: "read_mac" });
-    assert.deepEqual(esptoolCommands(5), { flashId: "flash-id", readFlash: "read-flash", writeFlash: "write-flash", readMac: "read-mac" });
+    assert.deepEqual(esptoolCommands(4), { flashId: "flash_id", readFlash: "read_flash", writeFlash: "write_flash", verifyFlash: "verify_flash", readMac: "read_mac" });
+    assert.deepEqual(esptoolCommands(5), { flashId: "flash-id", readFlash: "read-flash", writeFlash: "write-flash", verifyFlash: "verify-flash", readMac: "read-mac" });
   });
 
   test("flash id parsing, v4 and v5 output", () => {
@@ -341,23 +347,296 @@ describe("backup, restore and the upload gate with fake tools", () => {
     assert.deepEqual(args.slice(args.indexOf("--baud"), args.indexOf("--baud") + 2), ["--baud", "115200"]);
     assert.deepEqual(args.slice(-3, -1), ["write_flash", "0"]);
   });
+});
 
-  test("upload gate: AVR backup found (weak match noted), missing backup refused with the weakness explained", async () => {
-    const found = await checkBackupGate(deps(), { fqbn: "arduino:avr:nano:cpu=atmega328old", port, backupDir: dir });
-    assert.equal(found.ok, true);
-    assert.equal(found.matched?.strength, "fqbn+port+usb");
-    assert.equal(found.note, AVR_WEAK_MATCH_NOTE);
+/** Bytes of the data records of an Intel HEX file, by address. */
+function hexBytes(text: string): Map<number, number> {
+  const out = new Map<number, number>();
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.startsWith(":")) continue;
+    const bytes = Buffer.from(line.slice(1), "hex");
+    if (bytes[3] !== 0) continue;
+    const addr = (bytes[1] << 8) | bytes[2];
+    for (let i = 0; i < bytes[0]; i++) out.set(addr + i, bytes[4 + i]);
+  }
+  return out;
+}
 
-    const empty = path.join(dir, "empty");
-    fs.mkdirSync(empty);
-    const missing = await checkBackupGate(deps(), { fqbn: "arduino:avr:nano:cpu=atmega328old", port, backupDir: empty });
-    assert.equal(missing.errorCode, "BACKUP_REQUIRED");
-    assert.match(missing.error!, /no unique ID/);
+describe("upload gate: the flash content must be restorable", () => {
+  const espPort = "/dev/cu.usbserial-240";
+  const avrPort = "/dev/cu.usbserial-230";
+  const avrdude = "/A15/packages/arduino/tools/avrdude/8.0.0-arduino1/bin/avrdude";
+  const boardList = JSON.stringify({
+    detected_ports: [
+      { port: { address: espPort, properties: { vid: "0x1A86", pid: "0x7523", serialNumber: "" } } },
+      { port: { address: avrPort, properties: { vid: "0x1A86", pid: "0x7523", serialNumber: "" } } }
+    ]
+  });
+  const ESP_FQBN = "esp8266:esp8266:nodemcuv2";
+  const AVR_FQBN = "arduino:avr:nano:cpu=atmega328old";
+  const FLASH = 1024 * 1024;
+
+  let dir: string; // backup dir
+  let work: string; // images
+  let espFlash: Buffer;
+  let avrFlash: number[];
+  let verifyMode: "compare" | "error";
+  let readFails: boolean;
+  let log: string[]; // tool calls that matter
+
+  const deps = (): FirmwareDeps => ({
+    cliPath: "arduino-cli",
+    pathEnv: "",
+    fileExists: () => false,
+    now: () => new Date(2026, 10, 27, 10, 0, log.length),
+    run: async (command, args) => {
+      if (command === "arduino-cli" && args[0] === "board" && args[1] === "list") return ok(boardList);
+      if (command === "arduino-cli" && args[1] === "details") {
+        return args[3]?.startsWith("arduino:avr") ? ok(NANO_OLD_PROPS) : failed("platform not installed");
+      }
+      if (command === avrdude) {
+        const read = args.find((a) => a.startsWith("-Uflash:r:"));
+        if (read) {
+          log.push("avr read");
+          fs.writeFileSync(read.slice("-Uflash:r:".length, -2), hexOf(avrFlash));
+          return ok("", "avrdude: Device signature = 1E 95 0F (ATmega328P)\nAvrdude done.  Thank you.");
+        }
+        const verify = args.find((a) => a.startsWith("-Uflash:v:"));
+        if (verify) {
+          log.push("avr verify");
+          if (verifyMode === "error") return failed("avrdude: stk500_getsync(): not in sync");
+          const wanted = hexBytes(fs.readFileSync(verify.slice("-Uflash:v:".length, -2), "utf8"));
+          for (const [addr, value] of wanted) {
+            if (avrFlash[addr] !== value) return failed(`avrdude: verification mismatch\n\tdevice 0x${(avrFlash[addr] ?? 0xff).toString(16)} != file 0x${value.toString(16)}`);
+          }
+          return ok("", `${wanted.size} bytes of flash verified\nAvrdude done.  Thank you.`);
+        }
+      }
+      if (command === "python3" && args.includes("version")) return ok("esptool.py v4.7.0\n4.7.0");
+      if (command === "python3" && args.includes("flash_id")) {
+        return ok("Chip is ESP8266EX\nMAC: 84:cc:a8:b0:07:90\nManufacturer: 20\nDevice: 4016\nDetected flash size: 1MB\n");
+      }
+      if (command === "python3" && args.includes("read_mac")) return ok("Chip is ESP8266EX\nMAC: 84:cc:a8:b0:07:90\n");
+      if (command === "python3" && args.includes("verify_flash")) {
+        log.push("esp verify");
+        if (verifyMode === "error") return failed("A fatal error occurred: Failed to connect to ESP8266");
+        const file = fs.readFileSync(args[args.length - 1]);
+        return file.equals(espFlash.subarray(0, file.length))
+          ? ok("-- verify OK (digest matched)")
+          : { ...failed("-- verify FAILED (digest mismatch)"), code: 2 };
+      }
+      if (command === "python3" && args.includes("read_flash")) {
+        log.push("esp read");
+        if (readFails) return failed("A fatal error occurred: Invalid head of packet (0x0D)");
+        fs.writeFileSync(args[args.length - 1], espFlash);
+        return ok("Read 1048576 bytes at 0x00000000");
+      }
+      return failed(`unexpected command ${command} ${args.join(" ")}`);
+    }
   });
 
-  test("upload gate: ESP matches by MAC", async () => {
-    const found = await checkBackupGate(deps(), { fqbn: "esp8266:esp8266:nodemcuv2", port, backupDir: path.join(dir, "esp") });
-    assert.equal(found.ok, true);
-    assert.equal(found.matched?.strength, "mac");
+  const espImage = (bytes: number, fill: number): UploadImage => {
+    const file = path.join(work, `esp-${bytes}-${fill}.bin`);
+    fs.writeFileSync(file, Buffer.alloc(bytes, fill));
+    return { path: file, format: "bin" };
+  };
+  const avrImage = (data: number[]): UploadImage => {
+    const file = path.join(work, `avr-${data.length}-${data[0]}.hex`);
+    fs.writeFileSync(file, hexOf(data));
+    return { path: file, format: "ihex" };
+  };
+  const espBoard: BoardIdentity = { family: "esp8266", fqbn: ESP_FQBN, port: espPort, usb: null, mac: "84:cc:a8:b0:07:90" };
+  const avrBoard: BoardIdentity = { family: "avr", fqbn: AVR_FQBN, port: avrPort, usb: { vid: "0x1A86", pid: "0x7523", serialNumber: null } };
+  const espGate = (image: UploadImage, extra: { autoBackup?: boolean } = {}) =>
+    checkBackupGate(deps(), { fqbn: ESP_FQBN, port: espPort, backupDir: dir, image, ...extra });
+  const avrGate = (image: UploadImage) => checkBackupGate(deps(), { fqbn: AVR_FQBN, port: avrPort, backupDir: dir, image });
+  const makeBackup = async (fqbn: string, port: string) => {
+    const made = await backupFirmware(deps(), { fqbn, port, backupDir: dir, label: "old" });
+    assert.equal(made.ok, true, made.error);
+    log = [];
+    return made;
+  };
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "gate-backups-"));
+    work = fs.mkdtempSync(path.join(os.tmpdir(), "gate-images-"));
+    espFlash = Buffer.alloc(FLASH, 0xff);
+    avrFlash = [...Array(256).fill(0xff)];
+    verifyMode = "compare";
+    readFails = false;
+    log = [];
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(work, { recursive: true, force: true });
+  });
+
+  test("the region is the new image rounded up to whole sectors", () => {
+    assert.equal(espRegionBytes(1), 4096);
+    assert.equal(espRegionBytes(4096), 4096);
+    assert.equal(espRegionBytes(5000), 8192);
+  });
+
+  test("ESP: the flash holds the newest backup -> upload allowed, comparison backup", async () => {
+    espFlash.fill(0x11, 0, 6000);
+    await makeBackup(ESP_FQBN, espPort);
+    const result = await espGate(espImage(5000, 0x22));
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.comparison, "backup");
+    assert.deepEqual(result.region, { offset: 0, bytes: 8192 });
+    assert.deepEqual(log, ["esp verify"], "no new read of the whole flash");
+    assert.ok(result.matched?.sidecarPath.endsWith(".json"));
+  });
+
+  test("ESP: a change outside the program region is not a mismatch", async () => {
+    espFlash.fill(0x11, 0, 6000);
+    await makeBackup(ESP_FQBN, espPort);
+    espFlash.fill(0x77, 8192, 20000); // Wi-Fi settings / file system / EEPROM emulation changed while the program ran
+    const result = await espGate(espImage(5000, 0x22));
+    assert.equal(result.comparison, "backup");
+  });
+
+  test("ESP: the flash holds the last upload -> comparison last-upload, no backup read", async () => {
+    espFlash.fill(0x11, 0, 6000);
+    await makeBackup(ESP_FQBN, espPort); // old backup: does not match any more
+    const uploaded = espImage(5000, 0x33);
+    writeUploadRecord(deps(), { backupDir: dir, board: espBoard, image: uploaded, sketchPath: "/s", bootMarker: "BOOT x v4" });
+    espFlash.fill(0xff, 0, 8192);
+    fs.readFileSync(uploaded.path).copy(espFlash, 0); // what the upload wrote; the rest of its last sector is erased
+    espFlash.fill(0x55, 100000, 120000); // other areas changed
+    const result = await espGate(espImage(4000, 0x44));
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.comparison, "last-upload");
+    assert.equal(result.lastUpload?.bootMarker, "BOOT x v4");
+    assert.deepEqual(log, ["esp verify"]);
+  });
+
+  test("ESP: an upload record that does not cover the new region is not enough", async () => {
+    espFlash.fill(0x11, 0, 6000);
+    await makeBackup(ESP_FQBN, espPort);
+    const uploaded = espImage(3000, 0x33); // 1 sector
+    writeUploadRecord(deps(), { backupDir: dir, board: espBoard, image: uploaded });
+    espFlash.fill(0xff, 0, 8192);
+    fs.readFileSync(uploaded.path).copy(espFlash, 0);
+    espFlash.fill(0x99, 4096, 5000); // something else lives in the second sector
+    const result = await espGate(espImage(5000, 0x44)); // needs 2 sectors
+    assert.equal(result.comparison, "new-backup");
+  });
+
+  test("ESP: the flash matches neither -> new backup, then upload allowed (new-backup)", async () => {
+    espFlash.fill(0x11, 0, 6000);
+    await makeBackup(ESP_FQBN, espPort);
+    espFlash.fill(0x88, 0, 6000); // somebody flashed a program with the Arduino IDE
+    const before = fs.readdirSync(dir).filter((f) => f.endsWith(".bin")).length;
+    const result = await espGate(espImage(5000, 0x22));
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.comparison, "new-backup");
+    assert.equal(fs.readdirSync(dir).filter((f) => f.endsWith(".bin")).length, before + 1);
+    assert.equal(result.newBackup?.bytes, FLASH);
+    assert.match(result.newBackup!.sha256, /^[0-9a-f]{64}$/);
+    assert.equal(fs.readFileSync(result.newBackup!.imagePath)[0], 0x88, "the new backup holds the program that was on the board");
+    assert.ok(log.includes("esp read"));
+  });
+
+  test("ESP: no backup and no record at all -> new backup too", async () => {
+    const result = await espGate(espImage(5000, 0x22));
+    assert.equal(result.comparison, "new-backup");
+  });
+
+  test("ESP: the flash matches neither and the backup fails -> BACKUP_REQUIRED, no upload", async () => {
+    espFlash.fill(0x11, 0, 6000);
+    await makeBackup(ESP_FQBN, espPort);
+    espFlash.fill(0x88, 0, 6000);
+    readFails = true;
+    const result = await espGate(espImage(5000, 0x22));
+    assert.equal(result.ok, false);
+    assert.equal(result.errorCode, "BACKUP_REQUIRED");
+    assert.match(result.error!, /automatic backup failed/);
+    assert.match(result.error!, /Nothing was uploaded/);
+  });
+
+  test("ESP: automatic backup off -> BACKUP_REQUIRED when the flash matches neither", async () => {
+    const result = await espGate(espImage(5000, 0x22), { autoBackup: false });
+    assert.equal(result.ok, false);
+    assert.equal(result.errorCode, "BACKUP_REQUIRED");
+    assert.deepEqual(log, []);
+  });
+
+  test("ESP: the verify command fails -> no upload, no backup attempt (fail safe)", async () => {
+    espFlash.fill(0x11, 0, 6000);
+    await makeBackup(ESP_FQBN, espPort);
+    verifyMode = "error";
+    const result = await espGate(espImage(5000, 0x22));
+    assert.equal(result.ok, false);
+    assert.equal(result.errorCode, "FLASH_CHECK_FAILED");
+    assert.match(result.error!, /Nothing was uploaded/);
+    assert.ok(!log.includes("esp read"));
+  });
+
+  test("ESP: a damaged backup image is not trusted", async () => {
+    espFlash.fill(0x11, 0, 6000);
+    const made = await makeBackup(ESP_FQBN, espPort);
+    fs.appendFileSync(made.imagePath!, "x"); // sha256 no longer matches its sidecar
+    const result = await espGate(espImage(5000, 0x22));
+    assert.equal(result.comparison, "new-backup");
+  });
+
+  test("an upload record of another board is ignored", () => {
+    writeUploadRecord(deps(), { backupDir: dir, board: { ...espBoard, mac: "5c:cf:7f:00:00:01" }, image: espImage(100, 1) });
+    assert.equal(findLastUpload(dir, espBoard), null);
+    writeUploadRecord(deps(), { backupDir: dir, board: espBoard, image: espImage(100, 2) });
+    assert.ok(findLastUpload(dir, espBoard));
+  });
+
+  test("upload record: image copy, sha256, board identity, and uploads/ stays out of git", () => {
+    fs.writeFileSync(path.join(dir, ".gitignore"), "something\n");
+    const image = espImage(100, 7);
+    const written = writeUploadRecord(deps(), { backupDir: dir, board: espBoard, image, sketchPath: "/s/probe", bootMarker: "BOOT probe v4" });
+    assert.ok(written.recordPath.startsWith(path.join(dir, "uploads")));
+    const copy = path.join(dir, "uploads", written.record.image.file);
+    assert.ok(fs.readFileSync(copy).equals(fs.readFileSync(image.path)));
+    assert.equal(written.record.image.sha256, crypto.createHash("sha256").update(fs.readFileSync(copy)).digest("hex"));
+    assert.equal(written.record.mac, "84:cc:a8:b0:07:90");
+    assert.equal(written.record.fqbn, ESP_FQBN);
+    assert.equal(written.record.bootMarker, "BOOT probe v4");
+    assert.match(written.record.createdAt, /^\d{4}-\d\d-\d\dT.*Z$/);
+    assert.match(fs.readFileSync(path.join(dir, ".gitignore"), "utf8"), /^uploads\/$/m);
+  });
+
+  test("AVR: the flash holds the newest backup (weak match noted)", async () => {
+    avrFlash = [...Array(64).fill(0x11), ...Array(192).fill(0xff)];
+    await makeBackup(AVR_FQBN, avrPort);
+    const result = await avrGate(avrImage(Array(32).fill(0x22)));
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.comparison, "backup");
+    assert.equal(result.matched?.strength, "fqbn+port+usb");
+    assert.equal(result.note, AVR_WEAK_MATCH_NOTE);
+    assert.deepEqual(log, ["avr verify"]);
+  });
+
+  test("AVR: the flash holds the last upload", async () => {
+    avrFlash = [...Array(64).fill(0x11), ...Array(192).fill(0xff)];
+    await makeBackup(AVR_FQBN, avrPort);
+    const uploaded = avrImage(Array(64).fill(0x33));
+    writeUploadRecord(deps(), { backupDir: dir, board: avrBoard, image: uploaded });
+    avrFlash = [...Array(64).fill(0x33), ...Array(192).fill(0xff)];
+    const result = await avrGate(avrImage(Array(48).fill(0x44)));
+    assert.equal(result.comparison, "last-upload");
+    // a longer new image is not covered by the record (it would overwrite unrecorded flash)
+    const longer = await avrGate(avrImage(Array(96).fill(0x55)));
+    assert.equal(longer.comparison, "new-backup");
+  });
+
+  test("AVR: the flash matches neither -> new backup; the verify command fails -> no upload", async () => {
+    avrFlash = [...Array(64).fill(0x11), ...Array(192).fill(0xff)];
+    await makeBackup(AVR_FQBN, avrPort);
+    avrFlash = [...Array(64).fill(0x99), ...Array(192).fill(0xff)];
+    const neither = await avrGate(avrImage(Array(32).fill(0x22)));
+    assert.equal(neither.comparison, "new-backup");
+    avrFlash = [...Array(64).fill(0x11), ...Array(192).fill(0xff)];
+    verifyMode = "error";
+    const broken = await avrGate(avrImage(Array(32).fill(0x22)));
+    assert.equal(broken.ok, false);
+    assert.equal(broken.errorCode, "FLASH_CHECK_FAILED");
   });
 });

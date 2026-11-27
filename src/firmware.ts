@@ -10,6 +10,7 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { CommandResult } from "./arduinoCli.js";
 
@@ -162,9 +163,11 @@ export function avrdudePlan(props: Record<string, string>): { plan: AvrdudePlan 
   };
 }
 
-export function avrdudeArgs(plan: AvrdudePlan, port: string, op: "read" | "write", file: string): string[] {
+export function avrdudeArgs(plan: AvrdudePlan, port: string, op: "read" | "write" | "verify", file: string): string[] {
   const base = [`-C${plan.config}`, `-p${plan.mcu}`, `-c${plan.protocol}`, `-P${port}`];
   if (plan.speed) base.push(`-b${plan.speed}`);
+  // Verify: compare the flash with the file; nothing is written.
+  if (op === "verify") return [...base, `-Uflash:v:${file}:i`];
   // Writing: -D as in the core's upload pattern (the bootloader erases page by page); verify stays on.
   // Reading: -v so avrdude 8 prints the device signature (the chip id recorded in the sidecar).
   return op === "read" ? [...base, "-v", `-Uflash:r:${file}:i`] : [...base, "-D", `-Uflash:w:${file}:i`];
@@ -269,6 +272,7 @@ export function esptoolCommands(major: number) {
     flashId: name("flash_id"),
     readFlash: name("read_flash"),
     writeFlash: name("write_flash"),
+    verifyFlash: name("verify_flash"),
     readMac: name("read_mac")
   };
 }
@@ -363,12 +367,21 @@ export interface BoardIdentity {
 
 export type MatchStrength = "mac" | "fqbn+port+usb";
 
+/** The fields of a sidecar or an upload record that say which board it belongs to. */
+export interface BoardTagged {
+  family: FirmwareFamily;
+  fqbn: string;
+  port: string;
+  usb: UsbIdentity | null;
+  mac?: string;
+}
+
 /**
  * Whether a backup belongs to the connected board. ESP boards match on their MAC address. AVR boards
  * have no unique ID readable through the bootloader, so they match on FQBN + port + USB VID/PID, which
  * any board of the same type on the same port and USB chip also passes.
  */
-export function sidecarMatchesBoard(sidecar: FirmwareSidecar, board: BoardIdentity): { match: boolean; strength?: MatchStrength } {
+export function sidecarMatchesBoard(sidecar: BoardTagged, board: BoardIdentity): { match: boolean; strength?: MatchStrength } {
   if (sidecar.family !== board.family) return { match: false };
   if (board.family === "avr") {
     const usbMatch =
@@ -508,6 +521,12 @@ function ensureBackupDir(dir: string) {
   if (!fs.existsSync(ignore)) {
     // ESP images usually hold the saved Wi-Fi name and password in plain text: never commit backups.
     fs.writeFileSync(ignore, "*\n");
+  } else {
+    // An older or hand-written .gitignore must also cover the upload records in uploads/ (they hold images too).
+    const lines = fs.readFileSync(ignore, "utf8").split(/\r?\n/).map((line) => line.trim());
+    if (!lines.some((line) => line === "*" || line === "uploads" || line === "uploads/")) {
+      fs.appendFileSync(ignore, `${fs.readFileSync(ignore, "utf8").endsWith("\n") ? "" : "\n"}uploads/\n`);
+    }
   }
 }
 
@@ -741,16 +760,200 @@ export async function restoreFirmware(deps: FirmwareDeps, input: RestoreInput): 
   return fail("UNSUPPORTED_BOARD", `Firmware restore supports arduino:avr, esp8266 and esp32 boards, not ${input.fqbn}.`, steps);
 }
 
+// ------------------------------------------------------------------ upload gate
+
+/** An ESP image is written in whole flash sectors, so this is the unit of "what an upload overwrites". */
+export const ESP_SECTOR_BYTES = 4096;
+
+export function espRegionBytes(imageBytes: number): number {
+  return Math.ceil(imageBytes / ESP_SECTOR_BYTES) * ESP_SECTOR_BYTES;
+}
+
+/** The compiled image an upload is about to write. */
+export interface UploadImage {
+  path: string;
+  format: "ihex" | "bin";
+}
+
+export type GateComparison = "backup" | "last-upload" | "new-backup";
+
+export interface UploadRecord extends BoardTagged {
+  formatVersion: 1;
+  createdAt: string;
+  sketchPath: string | null;
+  bootMarker: string | null;
+  image: { file: string; format: "ihex" | "bin"; bytes: number; sha256: string };
+}
+
+export function uploadsDir(backupDir: string): string {
+  return path.join(backupDir, "uploads");
+}
+
+export function readUploadRecord(file: string): UploadRecord | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as UploadRecord;
+    return parsed && parsed.formatVersion === 1 && parsed.image?.file && parsed.family ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Newest upload record of this board in <backupDir>/uploads whose image file is still there. */
+export function findLastUpload(
+  backupDir: string,
+  board: BoardIdentity
+): { recordPath: string; record: UploadRecord } | null {
+  const dir = uploadsDir(backupDir);
+  if (!fs.existsSync(dir)) return null;
+  const found = fs
+    .readdirSync(dir)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => ({ recordPath: path.join(dir, name), record: readUploadRecord(path.join(dir, name)) }))
+    .filter((entry): entry is { recordPath: string; record: UploadRecord } => entry.record !== null)
+    .filter((entry) => fs.existsSync(path.join(dir, entry.record.image.file)))
+    .sort((a, b) => b.record.createdAt.localeCompare(a.record.createdAt));
+  return found.find((entry) => sidecarMatchesBoard(entry.record, board).match) ?? null;
+}
+
+export interface WriteUploadRecordInput {
+  backupDir: string;
+  board: BoardIdentity;
+  sketchPath?: string;
+  image: UploadImage;
+  bootMarker?: string | null;
+}
+
+/** After a successful upload: keep a copy of the image and a record of which board got it. */
+export function writeUploadRecord(deps: Pick<FirmwareDeps, "now">, input: WriteUploadRecordInput): { recordPath: string; record: UploadRecord } {
+  const date = (deps.now ?? (() => new Date()))();
+  ensureBackupDir(input.backupDir);
+  const dir = uploadsDir(input.backupDir);
+  fs.mkdirSync(dir, { recursive: true });
+  const base = backupBaseName(`upload ${input.board.family}`, input.board.family, date);
+  const imageFile = `${base}.${input.image.format === "ihex" ? "hex" : "bin"}`;
+  fs.copyFileSync(input.image.path, path.join(dir, imageFile));
+  const record: UploadRecord = {
+    formatVersion: 1,
+    createdAt: date.toISOString(),
+    family: input.board.family,
+    fqbn: input.board.fqbn,
+    port: input.board.port,
+    usb: input.board.usb,
+    ...(input.board.mac ? { mac: input.board.mac } : {}),
+    sketchPath: input.sketchPath ?? null,
+    bootMarker: input.bootMarker ?? null,
+    image: {
+      file: imageFile,
+      format: input.image.format,
+      bytes: fs.statSync(path.join(dir, imageFile)).size,
+      sha256: sha256File(path.join(dir, imageFile))
+    }
+  };
+  const recordPath = path.join(dir, `${base}.json`);
+  fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+  return { recordPath, record };
+}
+
+/** Add the boot marker that was seen after the upload to its record. */
+export function setUploadRecordBootMarker(recordPath: string, bootMarker: string): void {
+  const record = readUploadRecord(recordPath);
+  if (record) {
+    fs.writeFileSync(recordPath, `${JSON.stringify({ ...record, bootMarker }, null, 2)}\n`);
+  }
+}
+
+/** The compiled image of a sketch: build.path and build.project_name from `arduino-cli compile --show-properties`. */
+export async function findBuiltImage(
+  deps: FirmwareDeps,
+  sketchPath: string,
+  fqbn: string
+): Promise<{ image: UploadImage } | { error: string }> {
+  const family = familyFromFqbn(fqbn);
+  if (!family) return { error: `No image rules for ${fqbn}.` };
+  const raw = await deps.run(deps.cliPath, ["compile", sketchPath, "--fqbn", fqbn, "--show-properties"], 120_000);
+  if (!raw.ok) return { error: `arduino-cli compile --show-properties failed: ${tailOf(raw, 300)}` };
+  const props = parseProperties(raw.stdout);
+  const buildPath = props["build.path"];
+  const project = props["build.project_name"];
+  if (!buildPath || !project) return { error: "arduino-cli did not report build.path / build.project_name." };
+  const format = family === "avr" ? "ihex" : "bin";
+  const file = path.join(buildPath, `${project}.${format === "ihex" ? "hex" : "bin"}`);
+  if (!fs.existsSync(file)) return { error: `The built image ${file} does not exist (compile first).` };
+  return { image: { path: file, format } };
+}
+
 export interface BackupGateResult {
   ok: boolean;
   errorCode?: string;
   error?: string;
+  /** Which comparison let the upload through. */
+  comparison?: GateComparison;
+  /** The backup that matched (comparison "backup"). */
   matched?: { sidecarPath: string; strength: MatchStrength; createdAt: string };
+  /** The upload record that matched (comparison "last-upload"). */
+  lastUpload?: { recordPath: string; createdAt: string; bootMarker: string | null };
+  /** The backup made by the gate (comparison "new-backup"). */
+  newBackup?: { sidecarPath: string; imagePath: string; bytes: number; sha256: string };
+  /** What was compared: ESP bytes from offset 0, or the AVR address range of the new image. */
+  region?: { offset: number; bytes: number };
+  /** The board, for the upload record. */
+  board?: BoardIdentity;
   note?: string;
+  steps?: StepLog[];
 }
 
-/** BACKUP_BEFORE_UPLOAD: is there a backup of the connected board in backupDir? */
-export async function checkBackupGate(deps: FirmwareDeps, input: { fqbn: string | undefined; port: string; backupDir: string }): Promise<BackupGateResult> {
+type VerifyOutcome = { outcome: "match" | "mismatch" | "error"; detail: string };
+
+export function classifyEsptoolVerify(raw: CommandResult): VerifyOutcome {
+  const text = `${raw.stdout}\n${raw.stderr}`;
+  if (raw.ok && /digest matched/i.test(text)) return { outcome: "match", detail: "digest matched" };
+  if (/digest mismatch|verify failed|verification failed/i.test(text)) return { outcome: "mismatch", detail: "digest mismatch" };
+  return { outcome: "error", detail: tailOf(raw, 300) };
+}
+
+export function classifyAvrdudeVerify(raw: CommandResult): VerifyOutcome {
+  const text = `${raw.stdout}\n${raw.stderr}`;
+  if (raw.ok && /verified/i.test(text)) return { outcome: "match", detail: "verified" };
+  if (/verification error|mismatch/i.test(text)) return { outcome: "mismatch", detail: "verification mismatch" };
+  return { outcome: "error", detail: tailOf(raw, 300) };
+}
+
+function withTempFile<T>(bytes: Buffer, name: string, fn: (file: string) => Promise<T>): Promise<T> {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "flash-verify-"));
+  const file = path.join(dir, name);
+  fs.writeFileSync(file, bytes);
+  return fn(file).finally(() => fs.rmSync(dir, { recursive: true, force: true }));
+}
+
+function readPrefix(file: string, bytes: number): Buffer | null {
+  const fd = fs.openSync(file, "r");
+  try {
+    const buffer = Buffer.alloc(bytes);
+    const got = fs.readSync(fd, buffer, 0, bytes, 0);
+    return got === bytes ? buffer : null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * BACKUP_BEFORE_UPLOAD: an upload may overwrite the flash only if what is on the board now can be restored.
+ * That is the case when the part of the flash that the upload overwrites (the "region") is the same as
+ *   1. the image of the last upload this server made to this board, or
+ *   2. the newest backup of this board.
+ * Otherwise a new backup is made first (autoBackup, the default); if that is not possible, nothing is uploaded.
+ * If a comparison cannot be done, nothing is uploaded.
+ *
+ * ESP: region = the new image rounded up to whole 4096-byte sectors, from offset 0; compared with esptool
+ * verify_flash (on-chip MD5). Other flash areas (Wi-Fi settings, file system, EEPROM emulation) change while
+ * the program runs and are not compared. AVR: region = the address range of the new image; compared with
+ * avrdude verify.
+ */
+export async function checkBackupGate(
+  deps: FirmwareDeps,
+  input: { fqbn: string | undefined; port: string; backupDir: string; image: UploadImage; autoBackup?: boolean; label?: string }
+): Promise<BackupGateResult> {
+  const steps: StepLog[] = [];
   const family = familyFromFqbn(input.fqbn);
   if (!family || !input.fqbn) {
     return {
@@ -759,37 +962,170 @@ export async function checkBackupGate(deps: FirmwareDeps, input: { fqbn: string 
       error: `BACKUP_BEFORE_UPLOAD is set, but backup_firmware does not support ${input.fqbn ?? "a board without FQBN"}, so no backup can be checked. Nothing was uploaded.`
     };
   }
+  const fqbn = input.fqbn;
+  const checkFailed = (error: string): BackupGateResult => ({
+    ok: false,
+    errorCode: "FLASH_CHECK_FAILED",
+    error: `BACKUP_BEFORE_UPLOAD is set, but the flash of the board on ${input.port} could not be compared with its backup: ${error} Nothing was uploaded.`,
+    steps
+  });
+
+  // What the upload will write.
+  if (!fs.existsSync(input.image.path)) {
+    return checkFailed(`the image ${input.image.path} does not exist.`);
+  }
+  let imageBytes = 0;
+  let newHighestAddress = -1;
+  if (input.image.format === "bin") {
+    imageBytes = fs.statSync(input.image.path).size;
+    if (imageBytes === 0) return checkFailed("the image is empty.");
+  } else {
+    const stats = intelHexStats(fs.readFileSync(input.image.path, "utf8"));
+    if (!stats.valid || stats.dataBytes === 0) return checkFailed(`the HEX image is unusable (${stats.problem ?? "no data"}).`);
+    newHighestAddress = stats.highestAddress;
+    imageBytes = stats.highestAddress + 1;
+  }
+  const regionBytes = family === "avr" ? imageBytes : espRegionBytes(imageBytes);
+  const region = { offset: 0, bytes: regionBytes };
+
+  // Which board.
   const usb = await portUsbIdentity(deps, input.port);
   let mac: string | undefined;
+  let esptool: ResolvedEsptool | null = null;
+  let esptoolCmds: ReturnType<typeof esptoolCommands> | null = null;
+  let avrPlan: AvrdudePlan | null = null;
   if (family !== "avr") {
-    const esptool = await resolveEsptool(deps, await boardProperties(deps, input.fqbn));
+    esptool = await resolveEsptool(deps, await boardProperties(deps, fqbn));
     if (esptool) {
-      const cmds = esptoolCommands(esptool.version?.major ?? 4);
-      const raw = await deps.run(esptool.command, [...esptool.prefixArgs, "--port", input.port, cmds.readMac], 60_000);
+      esptoolCmds = esptoolCommands(esptool.version?.major ?? 4);
+      const raw = await deps.run(esptool.command, [...esptool.prefixArgs, "--port", input.port, esptoolCmds.readMac], 60_000);
       mac = raw.ok ? parseFlashId(`${raw.stdout}\n${raw.stderr}`).mac : undefined;
     }
-    if (!mac) {
+    if (!mac || !esptool || !esptoolCmds) {
       return {
         ok: false,
         errorCode: "BACKUP_REQUIRED",
         error: `BACKUP_BEFORE_UPLOAD is set, but the MAC address of the board on ${input.port} could not be read to find its backup. Nothing was uploaded.`
       };
     }
+  } else {
+    const props = await boardProperties(deps, fqbn);
+    const planned = props ? avrdudePlan(props) : { error: `arduino-cli board details failed for ${fqbn}.` };
+    if ("error" in planned) return checkFailed(planned.error);
+    avrPlan = planned.plan;
   }
-  const match = findMatchingBackup(input.backupDir, { family, fqbn: input.fqbn, port: input.port, usb, mac });
-  if (match) {
+  const board: BoardIdentity = { family, fqbn, port: input.port, usb, mac };
+  const weakNote = family === "avr" ? AVR_WEAK_MATCH_NOTE : undefined;
+
+  const verify = async (bytes: Buffer, name: string): Promise<VerifyOutcome> =>
+    withTempFile(bytes, name, async (file) => {
+      if (family === "avr") {
+        const raw = await logged(deps, steps, "avrdude verify flash", avrPlan!.cmd, avrdudeArgs(avrPlan!, input.port, "verify", file), 180_000);
+        return classifyAvrdudeVerify(raw);
+      }
+      const raw = await logged(
+        deps,
+        steps,
+        "esptool verify flash",
+        esptool!.command,
+        [...esptool!.prefixArgs, "--port", input.port, esptoolCmds!.verifyFlash, "0", file],
+        120_000
+      );
+      return classifyEsptoolVerify(raw);
+    });
+
+  // 1. The last upload of this server to this board.
+  const last = findLastUpload(input.backupDir, board);
+  if (last) {
+    const imageFile = path.join(uploadsDir(input.backupDir), last.record.image.file);
+    if (sha256File(imageFile) === last.record.image.sha256) {
+      let candidate: Buffer | null = null; // exactly the region, or null when the record does not cover it
+      const recorded = fs.readFileSync(imageFile);
+      if (family === "avr") {
+        const old = intelHexStats(recorded.toString("utf8"));
+        if (old.valid && newHighestAddress <= old.highestAddress) candidate = recorded;
+      } else {
+        const padded = Buffer.alloc(espRegionBytes(recorded.length), 0xff); // the rest of the last sector is erased flash
+        recorded.copy(padded);
+        if (regionBytes <= padded.length) candidate = padded.subarray(0, regionBytes);
+      }
+      if (candidate) {
+        const result = await verify(candidate, family === "avr" ? "last-upload.hex" : "last-upload.bin");
+        if (result.outcome === "error") return checkFailed(`${result.detail}`);
+        if (result.outcome === "match") {
+          return {
+            ok: true,
+            comparison: "last-upload",
+            lastUpload: { recordPath: last.recordPath, createdAt: last.record.createdAt, bootMarker: last.record.bootMarker },
+            region,
+            board,
+            note: weakNote,
+            steps
+          };
+        }
+      }
+    }
+  }
+
+  // 2. The newest backup of this board.
+  const backup = findMatchingBackup(input.backupDir, board);
+  if (backup) {
+    const imageFile = path.join(path.dirname(backup.sidecarPath), backup.sidecar.image.file);
+    if (sha256File(imageFile) === backup.sidecar.image.sha256) {
+      let candidate: Buffer | null = null;
+      if (family === "avr") {
+        const stats = intelHexStats(fs.readFileSync(imageFile, "utf8"));
+        if (stats.valid && newHighestAddress <= stats.highestAddress) candidate = fs.readFileSync(imageFile);
+      } else {
+        candidate = readPrefix(imageFile, regionBytes);
+      }
+      if (candidate) {
+        const result = await verify(candidate, family === "avr" ? "backup.hex" : "backup.bin");
+        if (result.outcome === "error") return checkFailed(`${result.detail}`);
+        if (result.outcome === "match") {
+          return {
+            ok: true,
+            comparison: "backup",
+            matched: { sidecarPath: backup.sidecarPath, strength: backup.strength, createdAt: backup.sidecar.createdAt },
+            region,
+            board,
+            note: weakNote,
+            steps
+          };
+        }
+      }
+    }
+  }
+
+  // 3. Neither holds what is on the board now: save it first.
+  const reason =
+    "the flash of the board matches neither its last upload nor its newest backup" +
+    (backup || last ? "" : " (there is no backup and no upload record of this board)");
+  if (input.autoBackup === false) {
     return {
-      ok: true,
-      matched: { sidecarPath: match.sidecarPath, strength: match.strength, createdAt: match.sidecar.createdAt },
-      note: match.strength === "fqbn+port+usb" ? AVR_WEAK_MATCH_NOTE : undefined
+      ok: false,
+      errorCode: "BACKUP_REQUIRED",
+      error: `BACKUP_BEFORE_UPLOAD is set and ${reason}. Nothing was uploaded.`,
+      steps
+    };
+  }
+  const made = await backupFirmware(deps, { fqbn, port: input.port, backupDir: input.backupDir, label: input.label ?? "before upload" });
+  steps.push(...made.steps);
+  if (!made.ok || !made.sidecar || !made.imagePath || !made.sidecarPath) {
+    return {
+      ok: false,
+      errorCode: "BACKUP_REQUIRED",
+      error: `BACKUP_BEFORE_UPLOAD is set, ${reason}, and the automatic backup failed (${made.errorCode}: ${made.error}). Nothing was uploaded.`,
+      steps
     };
   }
   return {
-    ok: false,
-    errorCode: "BACKUP_REQUIRED",
-    error:
-      `BACKUP_BEFORE_UPLOAD is set and ${input.backupDir} has no backup of the board on ${input.port}` +
-      (family === "avr" ? ` (matched on FQBN + port + USB VID/PID). ${AVR_WEAK_MATCH_NOTE}` : ` (matched on MAC ${mac}).`) +
-      " Nothing was uploaded."
+    ok: true,
+    comparison: "new-backup",
+    newBackup: { sidecarPath: made.sidecarPath, imagePath: made.imagePath, bytes: made.sidecar.image.bytes, sha256: made.sidecar.image.sha256 },
+    region,
+    board,
+    note: weakNote,
+    steps
   };
 }

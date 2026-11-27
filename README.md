@@ -117,10 +117,17 @@ marker is not seen, `errorCode` says why: `READY_BOOTED_BEFORE_MONITOR` (ESP boa
 `backup_firmware` saves the flash to `BACKUP_DIR` from `tools/board.env` (default `<project>/backups/`, or pass
 `backupDir`) and writes a `.gitignore` (`*`) there: ESP images usually contain the saved Wi-Fi name and password in
 plain text. The sidecar records FQBN, port, USB VID/PID, chip/flash id (MAC for ESP), flash size, sha256, the tool and
-its version. With `BACKUP_BEFORE_UPLOAD=1` in `tools/board.env`, `upload_sketch` and `upload_and_wait_ready` refuse
-until a backup of the connected board exists (ESP: matched by MAC; AVR: by FQBN + port + USB VID/PID, which any board
-of the same type on that port also passes), unless the call passes `backupOverrideApproved=true` after the user
-approved it. Erasing flash, fuses/eFuses and bootloaders are out of scope.
+its version. With `BACKUP_BEFORE_UPLOAD=1` in `tools/board.env`, `upload_sketch` and `upload_and_wait_ready` compile
+first and then check that the part of the flash the upload overwrites (the "region") can be restored. It can if the
+region equals (1) the image of the last upload this server made to the board (`<BACKUP_DIR>/uploads/`) or (2) the
+newest backup of the board (ESP: matched by MAC; AVR: by FQBN + port + USB VID/PID, which any board of the same type on
+that port also passes). ESP: region = the new image rounded up to 4096-byte sectors from offset 0, compared with
+`esptool verify_flash` (on-chip MD5; Wi-Fi settings, file system and EEPROM emulation are not compared). AVR: region =
+the address range of the new image, compared with `avrdude` verify. If neither matches, the server makes a new backup
+and then uploads (a full ESP read takes several minutes); if the backup or a comparison fails, nothing is uploaded
+(`BACKUP_REQUIRED`, `FLASH_CHECK_FAILED`). The upload result reports `backup.comparison` = `last-upload`, `backup` or
+`new-backup`. After each gated upload the image and a record (board, sketch, FQBN, boot marker, sha256, UTC time) are
+saved in `uploads/`. `backupOverrideApproved=true` skips all of this, after the user approved it. Erasing flash, fuses/eFuses and bootloaders are out of scope.
 
 **Resources:**
 - `arduino://boards/reference` — structured board pin/capability reference

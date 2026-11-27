@@ -8,7 +8,7 @@
 //   LIBS, CORE, BOARD_URLS   setup info (comma separated lists)
 //   OUTPUTS      what the board's outputs drive: leds | low-voltage | mains
 //   BACKUP_DIR   where backup_firmware saves images, relative to the project root (default backups/)
-//   BACKUP_BEFORE_UPLOAD  1 = uploads refuse until a firmware backup of the connected board exists
+//   BACKUP_BEFORE_UPLOAD  1 = an upload overwrites the flash only if its current content is saved (last upload, newest backup, or a new automatic backup)
 
 import fs from "node:fs";
 import path from "node:path";
